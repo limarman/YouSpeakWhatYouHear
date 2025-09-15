@@ -765,6 +765,40 @@ def compute_similarity_matrix_precomputed(
 	return M, details, {"precompute_seconds": prep_time, "align_seconds": align_time}
 
 
+def largest_connected_component(
+	M: np.ndarray,
+	*,
+	threshold: float,
+) -> List[int]:
+	"""Return indices of the largest connected component under similarity threshold.
+
+	Undirected graph: edge between i and j (i!=j) if M[i,j] >= threshold.
+	"""
+	N = M.shape[0]
+	visited = [False] * N
+	best_comp: List[int] = []
+	for s in range(N):
+		if visited[s]:
+			continue
+		# BFS
+		queue = [s]
+		visited[s] = True
+		comp = [s]
+		while queue:
+			u = queue.pop(0)
+			row = M[u]
+			for v in range(N):
+				if u == v or visited[v]:
+					continue
+				if float(row[v]) >= threshold:
+					visited[v] = True
+					queue.append(v)
+					comp.append(v)
+		if len(comp) > len(best_comp):
+			best_comp = comp
+	return sorted(best_comp)
+
+
 def _build_binary_timeline(
 	intervals: Sequence[Tuple[float, float]],
 	t0: float,

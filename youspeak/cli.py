@@ -9,6 +9,7 @@ from rich.table import Table
 from .config import ensure_data_dirs, DATA_DIR, DB_PATH
 from .data.db import init_db, list_content, get_content_by_id, insert_analysis
 from .parsers.subtitles import ingest_subtitle_from_source
+from .viewer.static_viewer import generate_static_preview
 from .fetchers.subliminal_fetcher import fetch_with_subliminal, fetch_with_subliminal_search, fetch_candidates_with_subliminal_search
 from .analysis.speech import analyze_subtitle_file
 from .analysis.consensus import compute_consensus, export_srt, export_anchored_srt
@@ -22,6 +23,7 @@ from .analysis.alignment import (
     compute_block_similarity_and_coverage,
     compute_similarity_matrix,
     compute_similarity_matrix_precomputed,
+    largest_connected_component,
 )
 
 
@@ -39,6 +41,7 @@ def similarity_matrix_cmd(
     dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
     recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
     precomputed: bool = typer.Option(False, help="Use precomputed hashed n-gram vectors (faster)"),
+    component_threshold: float = typer.Option(0.65, help="Edge threshold for largest connected component"),
 ) -> None:
     """Compute and print a pairwise similarity matrix for multiple subtitle files."""
     from pathlib import Path as _Path
@@ -129,7 +132,56 @@ def similarity_matrix_cmd(
     for i, row in enumerate(M):
         tbl.add_row(headers[i], *[f"{float(v):.3f}" for v in row])
     print(tbl)
+    # Largest connected component under threshold
+    comp_idx = largest_connected_component(M, threshold=component_threshold)
+    print({
+        "largest_component": {
+            "threshold": component_threshold,
+            "size": len(comp_idx),
+            "indices": comp_idx,
+            "files": [str(paths[k]) for k in comp_idx],
+        }
+    })
     print({"timing_seconds": timing_out})
+
+
+@app.command(name="preview-html")
+def preview_html_cmd(
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) to preview"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing .srt/.vtt"),
+	recursive: bool = typer.Option(False, help="Recursively include files under --dir"),
+	out: str = typer.Option("preview", help="Output directory for static viewer"),
+	title: str = typer.Option("Subtitle Preview", help="Page title"),
+	open_browser: bool = typer.Option(False, "--open", help="Open the viewer in your browser"),
+) -> None:
+	from pathlib import Path as _Path
+	paths: list[_Path] = []
+	if dir:
+		d = _Path(dir)
+		if not d.is_dir():
+			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
+		if recursive:
+			for p in sorted(d.rglob("*")):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+		else:
+			for p in sorted(d.iterdir()):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+	if files:
+		paths.extend([_Path(f) for f in files])
+	# de-duplicate
+	seen = set()
+	uniq: list[_Path] = []
+	for p in paths:
+		if str(p) not in seen:
+			seen.add(str(p))
+			uniq.append(p)
+	paths = uniq
+	if len(paths) == 0:
+		raise typer.BadParameter("Provide subtitle files via args or --dir")
+	res = generate_static_preview(paths, _Path(out), title=title, open_browser=open_browser)
+	print({"preview": res})
 @app.command(name="align-two")
 def align_two_cmd(
     file_a: str = typer.Argument(..., help="First subtitle file (.srt/.vtt)"),
@@ -212,11 +264,12 @@ def align_two_cmd(
     blocks_pm = compute_match_blocks_localmerge(align, S, A, B)
     if blocks_pm:
         tbl2 = _Table(title="Local-merged blocks (bidirectional gap absorb)")
+        tbl2.add_column("block")
         tbl2.add_column("A range [i0..i1]")
         tbl2.add_column("B range [j0..j1]")
         tbl2.add_column("score")
-        for (i0, i1), (j0, j1), sc in blocks_pm:
-            tbl2.add_row(f"[{i0}..{i1}]", f"[{j0}..{j1}]", f"{sc:.3f}")
+        for bi, ((i0, i1), (j0, j1), sc) in enumerate(blocks_pm):
+            tbl2.add_row(str(bi), f"[{i0}..{i1}]", f"[{j0}..{j1}]", f"{sc:.3f}")
         print(tbl2)
 
     if report_similarity:
@@ -267,18 +320,56 @@ def align_two_cmd(
 
         intervals_a = load_intervals(pa)
         intervals_b = load_intervals(pb)
-        xs, ys, ws = blocks_to_time_pairs(
-            blocks_pm,
-            intervals_a,
-            intervals_b,
-            include_start_end=(not centers_only),
-            include_center=centers_only,
-        )
-        a, b = fit_affine_from_pairs(xs, ys, ws if weight_pairs else None)
+        # Build equations with provenance per block
+        equations = []  # list of dicts: x, y, w, block_idx, a_range, b_range, kind
+        for bi, ((i0, i1), (j0, j1), sc) in enumerate(blocks_pm):
+            if i0 < 0 or i1 >= len(intervals_a) or j0 < 0 or j1 >= len(intervals_b):
+                continue
+            a_start = min(intervals_a[i][0] for i in range(i0, i1 + 1))
+            a_end = max(intervals_a[i][1] for i in range(i0, i1 + 1))
+            b_start = min(intervals_b[j][0] for j in range(j0, j1 + 1))
+            b_end = max(intervals_b[j][1] for j in range(j0, j1 + 1))
+            w = float(sc) if weight_pairs else 1.0
+            if not centers_only:
+                equations.append({
+                    "x": float(a_start), "y": float(b_start), "w": w,
+                    "block": bi, "a_range": [i0, i1], "b_range": [j0, j1], "kind": "start",
+                })
+                equations.append({
+                    "x": float(a_end), "y": float(b_end), "w": w,
+                    "block": bi, "a_range": [i0, i1], "b_range": [j0, j1], "kind": "end",
+                })
+            else:
+                a_c = 0.5 * (a_start + a_end)
+                b_c = 0.5 * (b_start + b_end)
+                equations.append({
+                    "x": float(a_c), "y": float(b_c), "w": w,
+                    "block": bi, "a_range": [i0, i1], "b_range": [j0, j1], "kind": "center",
+                })
+        xs = [e["x"] for e in equations]
+        ys = [e["y"] for e in equations]
+        ws = [e["w"] for e in equations] if weight_pairs else None
+        a, b = fit_affine_from_pairs(xs, ys, ws)
         # Clarify mapping direction: y (file_b) ≈ a * x (file_a) + b
+        # Spread samples across the full index range (early→late)
+        sample_n = min(24, len(equations))
+        if sample_n > 1:
+            idxs = sorted({int(round(k*(len(equations)-1)/(sample_n-1))) for k in range(sample_n)})
+        else:
+            idxs = [0]
+        sample = [{
+            "i": int(i),
+            "x": round(float(equations[i]["x"]), 3),
+            "y": round(float(equations[i]["y"]), 3),
+            "w": (round(float(equations[i]["w"]), 3) if weight_pairs else 1.0),
+            "a_range": equations[i]["a_range"],
+            "b_range": equations[i]["b_range"],
+            "kind": equations[i]["kind"],
+        } for i in idxs]
         print({
             "affine": {"a": round(a, 6), "b": round(b, 6)},
-            "pairs": len(xs),
+            "pairs": len(equations),
+            "equations_sample": sample,
             "mapping": {
                 "from": str(pa),
                 "to": str(pb),
