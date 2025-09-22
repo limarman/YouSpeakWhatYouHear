@@ -508,6 +508,117 @@ def compute_match_blocks_localmerge(
 	return blocks
 
 
+def compute_match_blocks_growmerge(
+    alignment: Sequence[Tuple[int | None, int | None]],
+    S: np.ndarray,
+    texts_a: Sequence[str],
+    texts_b: Sequence[str],
+    *,
+    n: int = 3,
+    min_improve: float = 0.02,
+) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
+    """Two-pass grow-merge: expand left, then right, only along one side per pass.
+
+    For each seed match (i,j):
+    1) LEFT PASS: If the immediate left neighbor is a gap on A or B side, pick the side
+       with the higher immediate improvement (if both exist). While the next left neighbor
+       on that side is a gap and concatenation improves by >= min_improve, absorb it.
+    2) RIGHT PASS: Repeat the same to the right.
+
+    Only gaps are consumed; blocks do not cross other matches. Covered alignment indices
+    are marked used to avoid duplicate emission.
+    """
+    def _strip(s: str) -> str:
+        return strip_separators_and_punct(s)
+
+    def _cos(a_txt: str, b_txt: str) -> float:
+        return char_ngram_cosine_similarity(_strip(a_txt), _strip(b_txt), n=n)
+
+    used = [False] * len(alignment)
+    blocks: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
+    for idx, (ai, bj) in enumerate(alignment):
+        if used[idx] or ai is None or bj is None:
+            continue
+        i0 = i1 = int(ai)
+        j0 = j1 = int(bj)
+        left_idx = right_idx = idx
+        a_txt = " ".join(texts_a[i0 : i1 + 1])
+        b_txt = " ".join(texts_b[j0 : j1 + 1])
+        score = _cos(a_txt, b_txt)
+
+        # LEFT PASS
+        while True:
+            if left_idx - 1 < 0 or used[left_idx - 1]:
+                break
+            lai, lbj = alignment[left_idx - 1]
+            # compute candidate deltas for available sides
+            best_side = None
+            best_new_score = score
+            # A-left gap available?
+            if lai is not None and lbj is None and int(lai) == i0 - 1:
+                a_cand = " ".join(texts_a[i0 - 1 : i1 + 1])
+                scA = _cos(a_cand, b_txt)
+                if scA - score >= min_improve and scA > best_new_score:
+                    best_side = "A_LEFT"
+                    best_new_score = scA
+            # B-left gap available?
+            if lbj is not None and lai is None and int(lbj) == j0 - 1:
+                b_cand = " ".join(texts_b[j0 - 1 : j1 + 1])
+                scB = _cos(a_txt, b_cand)
+                if scB - score >= min_improve and scB > best_new_score:
+                    best_side = "B_LEFT"
+                    best_new_score = scB
+            if best_side is None:
+                break
+            if best_side == "A_LEFT":
+                i0 -= 1
+                left_idx -= 1
+                a_txt = " ".join(texts_a[i0 : i1 + 1])
+            else:
+                j0 -= 1
+                left_idx -= 1
+                b_txt = " ".join(texts_b[j0 : j1 + 1])
+            score = best_new_score
+
+        # RIGHT PASS
+        while True:
+            if right_idx + 1 >= len(alignment) or used[right_idx + 1]:
+                break
+            rai, rbj = alignment[right_idx + 1]
+            best_side = None
+            best_new_score = score
+            # A-right gap?
+            if rai is not None and rbj is None and int(rai) == i1 + 1:
+                a_cand = " ".join(texts_a[i0 : i1 + 2])
+                scA = _cos(a_cand, b_txt)
+                if scA - score >= min_improve and scA > best_new_score:
+                    best_side = "A_RIGHT"
+                    best_new_score = scA
+            # B-right gap?
+            if rbj is not None and rai is None and int(rbj) == j1 + 1:
+                b_cand = " ".join(texts_b[j0 : j1 + 2])
+                scB = _cos(a_txt, b_cand)
+                if scB - score >= min_improve and scB > best_new_score:
+                    best_side = "B_RIGHT"
+                    best_new_score = scB
+            if best_side is None:
+                break
+            if best_side == "A_RIGHT":
+                i1 += 1
+                right_idx += 1
+                a_txt = " ".join(texts_a[i0 : i1 + 1])
+            else:
+                j1 += 1
+                right_idx += 1
+                b_txt = " ".join(texts_b[j0 : j1 + 1])
+            score = best_new_score
+
+        blocks.append(((i0, i1), (j0, j1), float(score)))
+        for k in range(left_idx, right_idx + 1):
+            used[k] = True
+    return blocks
+
+
 def blocks_to_time_pairs(
 	blocks: Sequence[Tuple[Tuple[int, int], Tuple[int, int], float]],
 	intervals_a: Sequence[Tuple[float, float]],
@@ -540,6 +651,161 @@ def blocks_to_time_pairs(
 			b_c = 0.5 * (b_start + b_end)
 			xs.append(float(a_c)); ys.append(float(b_c)); ws.append(float(sc))
 	return xs, ys, ws
+
+
+def blocks_to_center_pairs(
+	blocks: Sequence[Tuple[Tuple[int, int], Tuple[int, int], float]],
+	intervals_a: Sequence[Tuple[float, float]],
+	intervals_b: Sequence[Tuple[float, float]],
+) -> Tuple[List[float], List[float], List[float]]:
+	"""Extract centers-only (x=tA_center, y=tB_center) with weights from blocks."""
+	xs: List[float] = []
+	ys: List[float] = []
+	ws: List[float] = []
+	for (i0, i1), (j0, j1), sc in blocks:
+		if i0 < 0 or i1 >= len(intervals_a) or j0 < 0 or j1 >= len(intervals_b):
+			continue
+		a_start = min(intervals_a[i][0] for i in range(i0, i1 + 1))
+		a_end = max(intervals_a[i][1] for i in range(i0, i1 + 1))
+		b_start = min(intervals_b[j][0] for j in range(j0, j1 + 1))
+		b_end = max(intervals_b[j][1] for j in range(j0, j1 + 1))
+		a_c = 0.5 * (a_start + a_end)
+		b_c = 0.5 * (b_start + b_end)
+		xs.append(float(a_c))
+		ys.append(float(b_c))
+		ws.append(float(sc))
+	return xs, ys, ws
+
+
+def fit_piecewise_affine(
+	xs: Sequence[float],
+	ys: Sequence[float],
+	ws: Sequence[float],
+	*,
+	min_span_seconds: float = 60.0,
+	min_strong_matches: int = 10,
+	strong_sim_threshold: float = 0.9,
+) -> Tuple[List[Tuple[float, float, float, float]], List[dict]]:
+	"""Deprecated signature; use the version below with use_shift_only flag."""
+	return fit_piecewise_affine(xs, ys, ws,
+		min_span_seconds=min_span_seconds,
+		min_strong_matches=min_strong_matches,
+		strong_sim_threshold=strong_sim_threshold,
+		use_shift_only=False,
+		pair_blocks=None)
+
+
+def fit_piecewise_affine(
+	xs: Sequence[float],
+	ys: Sequence[float],
+	ws: Sequence[float],
+	*,
+	min_span_seconds: float = 60.0,
+	min_strong_matches: int = 10,
+	strong_sim_threshold: float = 0.9,
+	use_shift_only: bool = False,
+	pair_blocks: Sequence[int] | None = None,
+) -> Tuple[List[Tuple[float, float, float, float]], List[dict]]:
+	"""Fit piecewise affine y≈a*x+b over sorted pairs, left-to-right.
+
+	Segments are grown until both conditions are met:
+	- span_seconds >= min_span_seconds
+	- count_strong (w>=strong_sim_threshold) >= min_strong_matches
+
+	Returns (segments, diag) where segments is a list of (x_start, x_end, a, b)
+	and diag is a list of per-segment diagnostics dicts.
+	"""
+	if not xs:
+		return [], []
+	# sort by x
+	if pair_blocks is None:
+		pairs = sorted([(xs[i], ys[i], ws[i], None) for i in range(len(xs))], key=lambda t: t[0])
+	else:
+		pairs = sorted([(xs[i], ys[i], ws[i], pair_blocks[i]) for i in range(len(xs))], key=lambda t: t[0])
+	segments: List[Tuple[float, float, float, float]] = []
+	diags: List[dict] = []
+	N = len(pairs)
+	start_idx = 0
+	while start_idx < N:
+		end_idx = start_idx
+		x_start = pairs[start_idx][0]
+		strong = 0
+		while end_idx < N:
+			x_end = pairs[end_idx][0]
+			w = pairs[end_idx][2]
+			if w >= strong_sim_threshold:
+				strong += 1
+			span_ok = (x_end - x_start) >= min_span_seconds
+			count_ok = strong >= min_strong_matches
+			end_idx += 1
+			if span_ok and count_ok:
+				break
+		# If we hit EOF without satisfying, merge with previous (or take all remaining if first)
+		if end_idx > N and not segments:
+			end_idx = N
+		elif end_idx > N and segments:
+			# merge remainder into last segment by extending its x_end only; skip creating new
+			last_xs, last_ys, last_ws = [], [], []
+			for i in range(start_idx, N):
+				last_xs.append(pairs[i][0])
+				last_ys.append(pairs[i][1])
+				last_ws.append(pairs[i][2])
+			# Refit last segment using its original span plus remainder
+			# Extract previous
+			lx0, lx1, la, lb = segments[-1]
+			# Rebuild combined arrays within [lx0.. pairs[N-1][0]]
+			combined_xs = [x for x,y,w in pairs if lx0 <= x <= pairs[N-1][0]]
+			combined_ys = [y for x,y,w in pairs if lx0 <= x <= pairs[N-1][0]]
+			combined_ws = [w for x,y,w in pairs if lx0 <= x <= pairs[N-1][0]]
+			# Weighted LS for y≈a*x+b
+			A = np.stack([np.asarray(combined_xs), np.ones(len(combined_xs))], axis=1).astype(np.float64)
+			W = np.sqrt(np.asarray(combined_ws, dtype=np.float64))
+			Aw = A * W[:, None]
+			Yw = np.asarray(combined_ys, dtype=np.float64) * W
+			sol, *_ = np.linalg.lstsq(Aw, Yw, rcond=None)
+			la2 = float(sol[0]); lb2 = float(sol[1])
+			segments[-1] = (lx0, pairs[N-1][0], la2, lb2)
+			# diagnostics
+			pred = la2 * np.asarray(combined_xs) + lb2
+			res = (pred - np.asarray(combined_ys))
+			diags[-1] = {**diags[-1], "refit_extended": True, "rmse": float(np.sqrt(np.mean(res*res))), "count": int(len(combined_xs))}
+			break
+		# Normal segment creation
+		seg_pairs = pairs[start_idx:end_idx]
+		seg_xs = [p[0] for p in seg_pairs]
+		seg_ys = [p[1] for p in seg_pairs]
+		seg_ws = [p[2] for p in seg_pairs]
+		seg_b_start = seg_pairs[0][3]
+		seg_b_end = seg_pairs[-1][3]
+		if use_shift_only:
+			# y ≈ x + b => b = weighted mean of (y - x)
+			delta = np.asarray(seg_ys, dtype=np.float64) - np.asarray(seg_xs, dtype=np.float64)
+			w_arr = np.asarray(seg_ws, dtype=np.float64)
+			w_sum = float(np.sum(w_arr)) if np.isfinite(np.sum(w_arr)) and np.sum(w_arr) > 0 else float(len(seg_xs))
+			b = float(np.sum(w_arr * delta) / w_sum)
+			a = 1.0
+		else:
+			A = np.stack([np.asarray(seg_xs), np.ones(len(seg_xs))], axis=1).astype(np.float64)
+			W = np.sqrt(np.asarray(seg_ws, dtype=np.float64))
+			Aw = A * W[:, None]
+			Yw = np.asarray(seg_ys, dtype=np.float64) * W
+			sol, *_ = np.linalg.lstsq(Aw, Yw, rcond=None)
+			a = float(sol[0])
+			b = float(sol[1])
+		segments.append((seg_xs[0], seg_xs[-1], a, b))
+		pred = a * np.asarray(seg_xs) + b
+		res = (pred - np.asarray(seg_ys))
+		diags.append({
+			"x_start": float(seg_xs[0]), "x_end": float(seg_xs[-1]),
+			"a": a, "b": b,
+			"count": int(len(seg_xs)),
+			"strong": int(sum(1 for w in seg_ws if w >= strong_sim_threshold)),
+			"rmse": float(np.sqrt(np.mean(res*res))),
+			"block_start": (int(seg_b_start) if seg_b_start is not None else None),
+			"block_end": (int(seg_b_end) if seg_b_end is not None else None),
+		})
+		start_idx = end_idx
+	return segments, diags
 
 
 def fit_affine_from_pairs(
@@ -797,6 +1063,98 @@ def largest_connected_component(
 		if len(comp) > len(best_comp):
 			best_comp = comp
 	return sorted(best_comp)
+
+
+def compute_hardshift_transform(
+	equations: Sequence[dict],
+	intervals_a: Sequence[Tuple[float, float]],
+	intervals_b: Sequence[Tuple[float, float]],
+	*,
+	threshold: float = 0.9,
+) -> dict:
+	"""Build a piecewise shift transform from B->A using hard anchors from equations.
+
+	equations: list of dicts emitted by align-two with fields: x (tA), y (tB), w (sim), kind ('center'), i (optional index)
+	threshold: minimum similarity to consider an anchor 'hard'.
+	Returns a dict with boundaries (on B clock) and shifts (A-B) per segment.
+	"""
+	# Collect hard anchors with centers only
+	hard: List[Tuple[float, float, int]] = []
+	for idx, e in enumerate(equations):
+		kind = e.get("kind")
+		w = float(e.get("w", 0.0))
+		if kind == "center" and w >= threshold:
+			x = float(e.get("x", 0.0))  # tA
+			y = float(e.get("y", 0.0))  # tB
+			hard.append((y, x, int(e.get("i", idx))))
+	hard.sort(key=lambda t: t[0])
+	# Deduplicate equal B-times
+	dedup: List[Tuple[float, float, int]] = []
+	last_t: float | None = None
+	for tB, tA, idx in hard:
+		if last_t is None or tB > last_t + 1e-6:
+			dedup.append((tB, tA, idx))
+			last_t = tB
+	hard = dedup
+	if intervals_b:
+		b_min = float(min(s for s, _ in intervals_b))
+		b_max = float(max(e for _, e in intervals_b))
+	else:
+		b_min = 0.0
+		b_max = 0.0
+	if not hard:
+		return {
+			"type": "piecewise_shift",
+			"from": "B",
+			"to": "A",
+			"threshold": threshold,
+			"boundaries": [],
+			"shifts": [],
+			"anchors": [],
+		}
+	tBs = [h[0] for h in hard]
+	shifts = [float(h[1] - h[0]) for h in hard]
+	mids = [0.5 * (tBs[i] + tBs[i + 1]) for i in range(len(tBs) - 1)]
+	boundaries = [b_min] + mids + [b_max]
+	return {
+		"type": "piecewise_shift",
+		"from": "B",
+		"to": "A",
+		"threshold": threshold,
+		"boundaries": [float(x) for x in boundaries],
+		"shifts": [float(s) for s in shifts],
+		"anchors": [
+			{"t_file": float(h[0]), "t_ref": float(h[1]), "shift": float(h[1] - h[0]), "eq_index": int(h[2])}
+			for h in hard
+		],
+	}
+
+
+def find_shift_for_time(transform: dict, t: float) -> float:
+	"""Return the shift (seconds) for time t using a piecewise_shift transform."""
+	bounds = transform.get("boundaries", [])
+	shifts = transform.get("shifts", [])
+	if not bounds or not shifts:
+		return 0.0
+	if t <= bounds[0]:
+		return float(shifts[0])
+	for i in range(len(shifts)):
+		if bounds[i] <= t <= bounds[i + 1]:
+			return float(shifts[i])
+	return float(shifts[-1])
+
+
+def apply_piecewise_shift_to_intervals(
+	intervals: Sequence[Tuple[float, float]],
+	transform: dict,
+) -> List[Tuple[float, float]]:
+	"""Map intervals [s,e] by t' = t + shift(midpoint)."""
+	mapped: List[Tuple[float, float]] = []
+	for s, e in intervals:
+		mid = 0.5 * (float(s) + float(e))
+		b = find_shift_for_time(transform, mid)
+		mapped.append((float(s) + b, float(e) + b))
+	return mapped
 
 
 def _build_binary_timeline(

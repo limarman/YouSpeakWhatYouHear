@@ -25,6 +25,7 @@ INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
     <button id=\"zoomIn\">Zoom +</button>
     <button id=\"zoomOut\">Zoom -</button>
     <input id=\"search\" placeholder=\"search text\" />
+    <label style=\"margin-left:12px\"><input type=\"checkbox\" id=\"showOriginal\" /> Show original</label>
   </div>
   <div id=\"controls\"></div>
   <input id=\"slider\" type=\"range\" min=\"0\" max=\"1000\" step=\"1\" value=\"0\" />
@@ -42,9 +43,11 @@ body { font-family: system-ui, sans-serif; margin: 0; }
 #slider { width: 100%; }
 #container { position: relative; height: 70vh; overflow: auto; border-top: 1px solid #eee; }
 #timeline { height: 100%; background: #fafafa; }
-.ctrlRow { display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
+.ctrlRow { display: grid; grid-template-columns: 1fr auto auto auto auto auto; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
 .ctrlRow input { width: 80px; }
 .laneLabel { font-size: 12px; fill: #444; }
+.tick { stroke: #ccc; stroke-width: 1; }
+.tickLabel { font-size: 10px; fill: #666; dominant-baseline: central; }
 .cue { fill: #4a90e2; opacity: .6; cursor: pointer; }
 .cue.highlight { fill: #e24a5a; }
 .playhead { stroke: #222; stroke-width: 1; }
@@ -71,6 +74,7 @@ let playStartMs = 0;
 let playStartT = 0;
 let currentT = 0;
 let transforms = [];
+let piecewise = []; // per-track array of segments {x_start,x_end,a,b}
 
 function boot(){
   if (window.__DATA__) { data = window.__DATA__; init(); }
@@ -102,6 +106,35 @@ function init(){
   svg.setAttribute('viewBox', `0 0 ${totalWidth} ${height}`);
   svg.style.width = `${totalWidth}px`;
   svg.innerHTML = '';
+  // draw time axis ticks along the top
+  (function drawAxis(){
+    function fmtTime(s){
+      s = Math.max(0, Math.round(s));
+      const m = Math.floor(s/60); const ss = s % 60; return `${m}:${String(ss).padStart(2,'0')}`;
+    }
+    let step;
+    if (pxPerSec < 10) step = 120; else if (pxPerSec < 20) step = 60; else if (pxPerSec < 40) step = 30; else if (pxPerSec < 120) step = 10; else step = 5;
+    const start = Math.floor(tMin/step)*step;
+    const axisG = document.createElementNS('http://www.w3.org/2000/svg','g');
+    for (let t = start; t <= tMax; t += step){
+      const x = leftPad + (t - tMin)*pxPerSec;
+      const tick = document.createElementNS('http://www.w3.org/2000/svg','line');
+      tick.setAttribute('x1', x);
+      tick.setAttribute('x2', x);
+      tick.setAttribute('y1', 12);
+      tick.setAttribute('y2', 20);
+      tick.setAttribute('class','tick');
+      axisG.appendChild(tick);
+      const lab = document.createElementNS('http://www.w3.org/2000/svg','text');
+      lab.setAttribute('x', x);
+      lab.setAttribute('y', 8);
+      lab.setAttribute('text-anchor','middle');
+      lab.setAttribute('class','tickLabel');
+      lab.textContent = fmtTime(t);
+      axisG.appendChild(lab);
+    }
+    svg.appendChild(axisG);
+  })();
   // controls UI
   controls.innerHTML = '';
   data.tracks.forEach((tr, idx)=>{
@@ -110,11 +143,29 @@ function init(){
     const name = document.createElement('div'); name.textContent = tr.name;
     const aInp = document.createElement('input'); aInp.type='text'; aInp.value=String(transforms[idx].a);
     const bInp = document.createElement('input'); bInp.type='text'; bInp.value=String(transforms[idx].b);
+    const addSegBtn = document.createElement('button'); addSegBtn.textContent='Add seg';
+    const clrSegBtn = document.createElement('button'); clrSegBtn.textContent='Clear segs';
     const resetBtn = document.createElement('button'); resetBtn.textContent='Reset';
     aInp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ const v=parseFloat((aInp.value||'').replace(',','.')); if(!isNaN(v)){ transforms[idx].a=v; reflow(); } } });
     bInp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ const v=parseFloat((bInp.value||'').replace(',','.')); if(!isNaN(v)){ transforms[idx].b=v; reflow(); } } });
+    addSegBtn.addEventListener('click', ()=>{
+      const a = prompt('segment slope a', '1'); if (a===null) return;
+      const b = prompt('segment offset b (seconds)', '0'); if (b===null) return;
+      const xs = prompt('segment x_start (original seconds)', '0'); if (xs===null) return;
+      const xe = prompt('segment x_end (original seconds)', String(data.duration_seconds)); if (xe===null) return;
+      const aNum = parseFloat((a||'').replace(',','.'));
+      const bNum = parseFloat((b||'').replace(',','.'));
+      const xsNum = parseFloat((xs||'').replace(',','.'));
+      const xeNum = parseFloat((xe||'').replace(',','.'));
+      if ([aNum,bNum,xsNum,xeNum].some(v=>!isFinite(v))) return;
+      if (!piecewise[idx]) piecewise[idx] = [];
+      piecewise[idx].push({x_start: xsNum, x_end: xeNum, a: aNum, b: bNum});
+      piecewise[idx].sort((u,v)=>u.x_start - v.x_start);
+      reflow();
+    });
+    clrSegBtn.addEventListener('click', ()=>{ piecewise[idx] = []; reflow(); });
     resetBtn.addEventListener('click', ()=>{ transforms[idx]={a:1,b:0}; aInp.value='1'; bInp.value='0'; reflow(); });
-    row.appendChild(name); row.appendChild(aInp); row.appendChild(bInp); row.appendChild(resetBtn);
+    row.appendChild(name); row.appendChild(aInp); row.appendChild(bInp); row.appendChild(resetBtn); row.appendChild(addSegBtn); row.appendChild(clrSegBtn);
     controls.appendChild(row);
   });
   data.tracks.forEach((tr, idx)=>{
@@ -129,8 +180,15 @@ function init(){
   data.tracks.forEach((tr, idx)=>{
     const yTop = topPad + idx*(laneHeight+laneGap);
     const {a,b} = transforms[idx]||{a:1,b:0};
+    const segs = piecewise[idx]||[];
     tr.cues.forEach(c=>{
-      const s = a*c.s + b; const e = a*c.e + b; const ds = Math.max(0, s - tMin); const de = Math.max(0, e - tMin);
+      // choose segment if available based on cue midpoint
+      let aLoc=a, bLoc=b;
+      if (segs.length){
+        const mid = (c.s + c.e)/2;
+        for (let sg of segs){ if (mid >= sg.x_start && mid <= sg.x_end){ aLoc=sg.a; bLoc=sg.b; break; } }
+      }
+      const s = aLoc*c.s + bLoc; const e = aLoc*c.e + bLoc; const ds = Math.max(0, s - tMin); const de = Math.max(0, e - tMin);
       const x = leftPad + (ds)*pxPerSec;
       const w = Math.max(1, (de-ds)*pxPerSec);
       const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
@@ -143,9 +201,25 @@ function init(){
       r.addEventListener('mouseleave', ()=>{ r.classList.remove('highlight'); });
       r.addEventListener('click', ()=>{ setTime(c.s); });
       const title = document.createElementNS('http://www.w3.org/2000/svg','title');
-      title.textContent = c.t || '';
+      title.textContent = (c.i?(`#${c.i} `):'') + (c.t || '');
       r.appendChild(title);
       svg.appendChild(r);
+
+      // draw original overlay if enabled
+      const showOrig = document.getElementById('showOriginal');
+      if (showOrig && showOrig.checked){
+        const x0 = leftPad + Math.max(0, (c.s - tMin))*pxPerSec;
+        const w0 = Math.max(1, (c.e - c.s)*pxPerSec);
+        const r0 = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        r0.setAttribute('x', x0);
+        r0.setAttribute('y', yTop);
+        r0.setAttribute('width', w0);
+        r0.setAttribute('height', laneHeight);
+        r0.setAttribute('fill','none');
+        r0.setAttribute('stroke','#222');
+        r0.setAttribute('stroke-width','0.5');
+        svg.appendChild(r0);
+      }
     });
   });
   const ph = document.createElementNS('http://www.w3.org/2000/svg','line');
@@ -241,9 +315,9 @@ def generate_static_preview(paths: Sequence[Path], out_dir: Path, *, title: str 
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		cues = []
-		for s in segs:
+		for idx, s in enumerate(segs, start=1):
 			if s.end_seconds > s.start_seconds:
-				cues.append({"s": float(s.start_seconds), "e": float(s.end_seconds), "t": s.text or ""})
+				cues.append({"i": int(idx), "s": float(s.start_seconds), "e": float(s.end_seconds), "t": s.text or ""})
 				if s.end_seconds > max_end:
 					max_end = float(s.end_seconds)
 		tracks.append({"name": p.name, "cues": cues})

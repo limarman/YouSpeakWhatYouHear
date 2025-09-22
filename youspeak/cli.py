@@ -18,12 +18,16 @@ from .analysis.alignment import (
     char_ngram_cosine_similarity,
     needleman_wunsch_align,
     compute_match_blocks_localmerge,
+    compute_match_blocks_growmerge,
     blocks_to_time_pairs,
+    fit_piecewise_affine,
     fit_affine_from_pairs,
     compute_block_similarity_and_coverage,
     compute_similarity_matrix,
     compute_similarity_matrix_precomputed,
     largest_connected_component,
+    compute_hardshift_transform,
+    apply_piecewise_shift_to_intervals,
 )
 
 
@@ -198,6 +202,15 @@ def align_two_cmd(
     weight_pairs: bool = typer.Option(True, help="Weight pairs by merged block similarity"),
     centers_only: bool = typer.Option(False, help="Use only center→center pairs for fitting (no start/end)"),
     report_similarity: bool = typer.Option(True, help="Report block-based similarity, coverage, and combined score"),
+    piecewise: bool = typer.Option(False, help="Fit piecewise local affine segments from B to A"),
+    pw_min_span_seconds: float = typer.Option(60.0, help="Min segment span in seconds"),
+    pw_min_strong_matches: int = typer.Option(10, help="Min strong matches per segment"),
+    pw_strong_sim_threshold: float = typer.Option(0.9, help="Similarity threshold for strong matches"),
+    pw_shift_only: bool = typer.Option(False, help="Use shift-only (y≈x+b) per segment instead of affine"),
+    emit_hardshift_transform: bool = typer.Option(False, help="Emit piecewise shift transform from B to A using hard anchors (sim>=threshold)"),
+    hardshift_threshold: float = typer.Option(0.9, help="Similarity threshold for hard anchors (center-to-center)"),
+    write_transformed: str | None = typer.Option(None, help="Write transformed B subtitle (mapped to A's clock) to this .srt path using hard anchors"),
+    merge_grow: bool = typer.Option(True, help="Use iterative grow-merge (absorb consecutive gaps while similarity improves)"),
 ) -> None:
     """Align two subtitle files by text with Needleman–Wunsch and print a simple table."""
     from pathlib import Path as _Path
@@ -260,8 +273,11 @@ def align_two_cmd(
         )
     print(tbl)
 
-    # Local bidirectional merge (surroundings only)
-    blocks_pm = compute_match_blocks_localmerge(align, S, A, B)
+    # Merge blocks
+    if merge_grow:
+        blocks_pm = compute_match_blocks_growmerge(align, S, A, B)
+    else:
+        blocks_pm = compute_match_blocks_localmerge(align, S, A, B)
     if blocks_pm:
         tbl2 = _Table(title="Local-merged blocks (bidirectional gap absorb)")
         tbl2.add_column("block")
@@ -304,8 +320,8 @@ def align_two_cmd(
             }
         })
 
-    # Optionally fit affine mapping using local-merged blocks
-    if fit_affine:
+    # Optionally fit affine mapping and/or piecewise mapping using local-merged blocks
+    if fit_affine or piecewise:
         # Load intervals to extract times
         def load_intervals(p: _Path) -> list[tuple[float, float]]:
             data = p.read_bytes()
@@ -348,38 +364,137 @@ def align_two_cmd(
                 })
         xs = [e["x"] for e in equations]
         ys = [e["y"] for e in equations]
-        ws = [e["w"] for e in equations] if weight_pairs else None
-        a, b = fit_affine_from_pairs(xs, ys, ws)
-        # Clarify mapping direction: y (file_b) ≈ a * x (file_a) + b
-        # Spread samples across the full index range (early→late)
-        sample_n = min(24, len(equations))
-        if sample_n > 1:
-            idxs = sorted({int(round(k*(len(equations)-1)/(sample_n-1))) for k in range(sample_n)})
-        else:
-            idxs = [0]
-        sample = [{
-            "i": int(i),
-            "x": round(float(equations[i]["x"]), 3),
-            "y": round(float(equations[i]["y"]), 3),
-            "w": (round(float(equations[i]["w"]), 3) if weight_pairs else 1.0),
-            "a_range": equations[i]["a_range"],
-            "b_range": equations[i]["b_range"],
-            "kind": equations[i]["kind"],
-        } for i in idxs]
-        print({
-            "affine": {"a": round(a, 6), "b": round(b, 6)},
-            "pairs": len(equations),
-            "equations_sample": sample,
-            "mapping": {
-                "from": str(pa),
-                "to": str(pb),
-                "equation": f"t_to ≈ a * t_from + b",
-                "apply": {
-                    "map_from_to": "t' = a*t + b",
-                    "map_to_from": "t' = (t - b)/a",
+        ws = [e["w"] for e in equations]
+        pair_blocks = [e.get("block", None) for e in equations]
+        if piecewise:
+            segs, seg_diags = fit_piecewise_affine(
+                xs, ys, ws,
+                min_span_seconds=pw_min_span_seconds,
+                min_strong_matches=pw_min_strong_matches,
+                strong_sim_threshold=pw_strong_sim_threshold,
+                use_shift_only=pw_shift_only,
+                pair_blocks=pair_blocks,
+            )
+            print({
+                "piecewise": {
+                    "segments": [{"x_start": round(s[0],3), "x_end": round(s[1],3), "a": round(s[2],6), "b": round(s[3],6)} for s in segs],
+                    "diagnostics": seg_diags,
                 },
-            },
-        })
+                "pairs": len(equations),
+            })
+        if emit_hardshift_transform or write_transformed:
+            # Build hard anchors (centers-only recommended)
+            hard = [
+                (e["y"], e["x"], e.get("i", idx))
+                for idx, e in enumerate(equations)
+                if e.get("kind") == "center" and float(e.get("w", 0.0)) >= hardshift_threshold
+            ]
+            hard.sort(key=lambda t: t[0])  # sort by B time (source)
+            # Ensure strictly increasing in B; drop ties by keeping first
+            dedup = []
+            last_t = None
+            for tB, tA, idx in hard:
+                if last_t is None or tB > last_t + 1e-6:
+                    dedup.append((tB, tA, idx))
+                    last_t = tB
+            hard = dedup
+            # Compute boundaries on B clock (source)
+            if hard:
+                b_min = float(min(s for s,_ in intervals_b))
+                b_max = float(max(e for _,e in intervals_b))
+                tBs = [h[0] for h in hard]
+                shifts = [float(h[1] - h[0]) for h in hard]  # shift = tA - tB
+                # Midpoints between consecutive hard anchors
+                mids = [0.5*(tBs[i] + tBs[i+1]) for i in range(len(tBs)-1)]
+                boundaries = [b_min] + mids + [b_max]
+                transform = {
+                    "type": "piecewise_shift",
+                    "from": str(pb),
+                    "to": str(pa),
+                    "threshold": hardshift_threshold,
+                    "boundaries": [round(x, 3) for x in boundaries],
+                    "shifts": [round(s, 6) for s in shifts],
+                    "anchors": [
+                        {"t_file": round(h[0],3), "t_ref": round(h[1],3), "shift": round(h[1]-h[0],6), "eq_index": int(h[2])}
+                        for h in hard
+                    ],
+                }
+            else:
+                transform = {
+                    "type": "piecewise_shift",
+                    "from": str(pb),
+                    "to": str(pa),
+                    "threshold": hardshift_threshold,
+                    "boundaries": [],
+                    "shifts": [],
+                    "anchors": [],
+                }
+            if emit_hardshift_transform:
+                print({"hardshift_transform": transform})
+            if write_transformed and hard:
+                # Read full B segments with text
+                def load_segments(p: _Path):
+                    data = p.read_bytes()
+                    ext = p.suffix.lower().lstrip(".")
+                    if ext == "srt":
+                        return parse_srt_bytes(data)
+                    elif ext == "vtt":
+                        return parse_vtt_bytes(data)
+                    else:
+                        raise typer.BadParameter(f"Unsupported extension: {ext}")
+                segs_b = load_segments(pb)
+                # Map and build SRT using alignment.apply_piecewise_shift_to_intervals
+                def fmt(ts: float) -> str:
+                    ms = int(round((ts - int(ts)) * 1000))
+                    sec = int(ts) % 60
+                    minute = (int(ts) // 60) % 60
+                    hour = int(ts) // 3600
+                    return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
+                lines: list[str] = []
+                idx_out = 1
+                for s in segs_b:
+                    sb = float(s.start_seconds); eb = float(s.end_seconds)
+                    sa, ea = apply_piecewise_shift_to_intervals([(sb, eb)], transform)[0]
+                    if ea <= sa:  # skip zero/negative durations
+                        continue
+                    lines.append(str(idx_out)); idx_out += 1
+                    lines.append(f"{fmt(sa)} --> {fmt(ea)}")
+                    lines.append((s.text or "-").strip())
+                    lines.append("")
+                _Path(write_transformed).write_text("\n".join(lines), encoding="utf-8")
+                print({"written_transformed": write_transformed, "segments": len(segs_b), "kept": idx_out-1})
+        if fit_affine:
+            a, b = fit_affine_from_pairs(xs, ys, (ws if weight_pairs else None))
+            # Clarify mapping direction: y (file_b) ≈ a * x (file_a) + b
+            # Spread samples across the full index range (early→late)
+            sample_n = min(24, len(equations))
+            if sample_n > 1:
+                idxs = sorted({int(round(k*(len(equations)-1)/(sample_n-1))) for k in range(sample_n)})
+            else:
+                idxs = [0]
+            sample = [{
+                "i": int(i),
+                "x": round(float(equations[i]["x"]), 3),
+                "y": round(float(equations[i]["y"]), 3),
+                "w": (round(float(equations[i]["w"]), 3) if weight_pairs else 1.0),
+                "a_range": equations[i]["a_range"],
+                "b_range": equations[i]["b_range"],
+                "kind": equations[i]["kind"],
+            } for i in idxs]
+            print({
+                "affine": {"a": round(a, 6), "b": round(b, 6)},
+                "pairs": len(equations),
+                "equations_sample": sample,
+                "mapping": {
+                    "from": str(pa),
+                    "to": str(pb),
+                    "equation": f"t_to ≈ a * t_from + b",
+                    "apply": {
+                        "map_from_to": "t' = a*t + b",
+                        "map_to_from": "t' = (t - b)/a",
+                    },
+                },
+            })
 
 
 @app.command(name="init-db")
