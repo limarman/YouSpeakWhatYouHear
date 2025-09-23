@@ -1319,3 +1319,195 @@ def align_intervals(
 	return aligned, shifts
 
 
+def select_master_clock_by_median_duration(
+	subtitle_files: Sequence[str],
+	component_indices: Sequence[int],
+) -> Tuple[int, str]:
+	"""Select master clock file based on median duration from connected component.
+	
+	Args:
+		subtitle_files: List of all subtitle file paths
+		component_indices: Indices of files in the largest connected component
+	
+	Returns:
+		(master_index, master_file_path) where master_index is the index in subtitle_files
+	"""
+	from pathlib import Path as _Path
+	from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	
+	def load_segments(file_path: str):
+		"""Load segments from a subtitle file."""
+		p = _Path(file_path)
+		data = p.read_bytes()
+		ext = p.suffix.lower().lstrip(".")
+		if ext == "srt":
+			return parse_srt_bytes(data)
+		elif ext == "vtt":
+			return parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+	
+	durations = []
+	valid_indices = []
+	
+	for idx in component_indices:
+		try:
+			segments = load_segments(subtitle_files[idx])
+			if segments:
+				# Compute effective duration (last end - first start)
+				duration = segments[-1].end_seconds - segments[0].start_seconds
+				durations.append(duration)
+				valid_indices.append(idx)
+		except Exception:
+			continue  # Skip files that can't be parsed
+	
+	if not durations:
+		raise ValueError("No valid subtitle files found in connected component")
+	
+	# Find file with median duration
+	durations_array = np.array(durations)
+	median_duration = np.median(durations_array)
+	closest_idx = np.argmin(np.abs(durations_array - median_duration))
+	master_index = valid_indices[closest_idx]
+	
+	return master_index, subtitle_files[master_index]
+
+
+def align_multiple_subtitles_to_master(
+	subtitle_files: Sequence[str],
+	component_indices: Sequence[int],
+	master_index: int,
+	*,
+	n: int = 3,
+	gap_penalty: float = -0.4,
+	min_sim: float = 0.3,
+	hardshift_threshold: float = 0.9,
+) -> Dict[str, Any]:
+	"""Align multiple subtitle files to a master clock using hard-anchor piecewise shifts.
+	
+	Args:
+		subtitle_files: List of all subtitle file paths
+		component_indices: Indices of files in the largest connected component
+		master_index: Index of the master clock file
+		n: Character n-gram size
+		gap_penalty: Gap penalty for NW alignment
+		min_sim: Hard floor for match acceptance
+		hardshift_threshold: Similarity threshold for hard anchors
+	
+	Returns:
+		Dictionary with alignment results including transforms and metadata
+	"""
+	from pathlib import Path as _Path
+	from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	
+	def load_segments(file_path: str):
+		"""Load segments from a subtitle file."""
+		p = _Path(file_path)
+		data = p.read_bytes()
+		ext = p.suffix.lower().lstrip(".")
+		if ext == "srt":
+			return parse_srt_bytes(data)
+		elif ext == "vtt":
+			return parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+	
+	master_file = subtitle_files[master_index]
+	master_segments = load_segments(master_file)
+	
+	results = {
+		"master_file": master_file,
+		"master_index": master_index,
+		"transforms": {},
+		"metadata": {
+			"n": n,
+			"gap_penalty": gap_penalty,
+			"min_sim": min_sim,
+			"hardshift_threshold": hardshift_threshold,
+		}
+	}
+	
+	for idx in component_indices:
+		if idx == master_index:
+			# Identity transform for master
+			results["transforms"][subtitle_files[idx]] = {
+				"type": "identity",
+				"shifts": [],
+				"boundaries": [],
+			}
+			continue
+		
+		try:
+			other_file = subtitle_files[idx]
+			other_segments = load_segments(other_file)
+			
+			# Normalize texts
+			master_texts = [normalize_subtitle_text(seg.text) for seg in master_segments]
+			other_texts = [normalize_subtitle_text(seg.text) for seg in other_segments]
+			
+			# Align to master using NW + hard anchors
+			aligned_pairs, similarity_matrix = needleman_wunsch_align(
+				master_texts,
+				other_texts,
+				n=n,
+				gap_penalty=gap_penalty,
+				min_sim=min_sim,
+			)
+			
+			# Compute merged blocks
+			blocks = compute_match_blocks_growmerge(
+				aligned_pairs,
+				similarity_matrix,
+				master_texts,
+				other_texts,
+				n=n,
+			)
+			
+			# Convert blocks to equations format (center points only for hard anchors)
+			equations = []
+			master_intervals = [(seg.start_seconds, seg.end_seconds) for seg in master_segments]
+			other_intervals = [(seg.start_seconds, seg.end_seconds) for seg in other_segments]
+			
+			for bi, ((i0, i1), (j0, j1), score) in enumerate(blocks):
+				# Get time intervals for the block
+				master_start = master_intervals[i0][0]
+				master_end = master_intervals[i1][1]
+				other_start = other_intervals[j0][0]
+				other_end = other_intervals[j1][1]
+				
+				# Add center point (recommended for hard anchors)
+				master_center = 0.5 * (master_start + master_end)
+				other_center = 0.5 * (other_start + other_end)
+				equations.append({
+					"x": float(master_center),  # A time (master)
+					"y": float(other_center),   # B time (other)
+					"w": float(score),          # similarity weight
+					"kind": "center",
+					"i": bi,
+				})
+			
+			# Create hard-anchor piecewise shift transform
+			hardshift_transform = compute_hardshift_transform(
+				equations, 
+				master_intervals, 
+				other_intervals, 
+				threshold=hardshift_threshold
+			)
+			
+			results["transforms"][other_file] = {
+				"type": "piecewise_shift",
+				"shifts": hardshift_transform["shifts"],
+				"boundaries": hardshift_transform["boundaries"],
+				"num_anchors": len([eq for eq in equations if eq.get("w", 0) >= hardshift_threshold]),
+			}
+			
+		except Exception as e:
+			print(f"[red]Warning: Failed to align {subtitle_files[idx]} to master: {e}[/red]")
+			results["transforms"][subtitle_files[idx]] = {
+				"type": "failed",
+				"error": str(e),
+			}
+	
+	return results
+
+

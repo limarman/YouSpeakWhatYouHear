@@ -28,6 +28,8 @@ from .analysis.alignment import (
     largest_connected_component,
     compute_hardshift_transform,
     apply_piecewise_shift_to_intervals,
+    select_master_clock_by_median_duration,
+    align_multiple_subtitles_to_master,
 )
 
 
@@ -714,3 +716,197 @@ def consensus_cmd(
 	if export_anchored_srt_path:
 		_Path(export_anchored_srt_path).write_text(export_anchored_srt(unique_paths, res.intervals), encoding="utf-8")
 		print(f"[green]Wrote anchored consensus SRT to[/green] {export_anchored_srt_path}")
+
+
+@app.command(name="align-multiple")
+def align_multiple_cmd(
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) to align"),
+	n: int = typer.Option(3, help="Character n-gram size for similarity"),
+	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
+	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	precomputed: bool = typer.Option(True, help="Use precomputed hashed n-gram vectors (faster)"),
+	component_threshold: float = typer.Option(0.65, help="Edge threshold for largest connected component"),
+	hardshift_threshold: float = typer.Option(0.9, help="Similarity threshold for hard anchors"),
+	output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write aligned SRT files and metadata"),
+) -> None:
+	"""Align multiple subtitle files to a median-duration master clock using hard-anchor piecewise shifts."""
+	import os
+	import json
+	from pathlib import Path as _Path
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	
+	# Collect files
+	if files is None:
+		files = []
+	if dir:
+		import glob
+		pattern = "**/*.srt" if recursive else "*.srt"
+		dir_files = glob.glob(os.path.join(dir, pattern), recursive=recursive)
+		pattern = "**/*.vtt" if recursive else "*.vtt"
+		dir_files.extend(glob.glob(os.path.join(dir, pattern), recursive=recursive))
+		files.extend(dir_files)
+	
+	if len(files) < 2:
+		print("[red]Error:[/red] Need at least 2 subtitle files")
+		raise typer.Exit(1)
+	
+	print(f"[blue]Computing similarity matrix for {len(files)} files...[/blue]")
+	
+	# Load texts and intervals from files
+	def load_norm_texts_and_intervals(file_path: str) -> tuple[list[str], list[tuple[float, float]]]:
+		p = _Path(file_path)
+		data = p.read_bytes()
+		ext = p.suffix.lower().lstrip(".")
+		if ext == "srt":
+			segs = parse_srt_bytes(data)
+		elif ext == "vtt":
+			segs = parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+		texts = [
+			normalize_subtitle_text(s.text or "")
+			for s in segs
+		]
+		intervals = [(s.start_seconds, s.end_seconds) for s in segs]
+		return texts, intervals
+	
+	texts_list = []
+	intervals_list = []
+	for file_path in files:
+		t, iv = load_norm_texts_and_intervals(file_path)
+		texts_list.append(t)
+		intervals_list.append(iv)
+	
+	# Compute similarity matrix
+	if precomputed:
+		similarity_matrix, _details, _timing = compute_similarity_matrix_precomputed(
+			texts_list, intervals_list, n=n, gap_penalty=gap_penalty, min_sim=min_sim
+		)
+	else:
+		similarity_matrix, _details = compute_similarity_matrix(
+			texts_list, intervals_list, n=n, gap_penalty=gap_penalty, min_sim=min_sim
+		)
+	
+	# Find largest connected component
+	component_indices = largest_connected_component(similarity_matrix, threshold=component_threshold)
+	
+	if len(component_indices) < 2:
+		print(f"[red]Error:[/red] Largest connected component has only {len(component_indices)} files (need ≥2)")
+		print("Consider lowering --component-threshold")
+		raise typer.Exit(1)
+	
+	print(f"[green]Found connected component with {len(component_indices)} files[/green]")
+	for idx in component_indices:
+		print(f"  • {files[idx]}")
+	
+	# Select master clock based on median duration
+	master_index, master_file = select_master_clock_by_median_duration(files, component_indices)
+	print(f"[yellow]Master clock:[/yellow] {master_file}")
+	
+	# Align all files to master clock
+	print(f"[blue]Aligning {len(component_indices)} files to master clock...[/blue]")
+	results = align_multiple_subtitles_to_master(
+		files,
+		component_indices,
+		master_index,
+		n=n,
+		gap_penalty=gap_penalty,
+		min_sim=min_sim,
+		hardshift_threshold=hardshift_threshold,
+	)
+	
+	# Print summary
+	print("\n[green]Alignment Results:[/green]")
+	successful = 0
+	failed = 0
+	for file_path, transform in results["transforms"].items():
+		if transform["type"] == "failed":
+			print(f"  [red]✗[/red] {os.path.basename(file_path)} (failed: {transform['error']})")
+			failed += 1
+		elif transform["type"] == "identity":
+			print(f"  [yellow]◯[/yellow] {os.path.basename(file_path)} (master)")
+			successful += 1
+		else:
+			num_anchors = transform.get("num_anchors", 0)
+			print(f"  [green]✓[/green] {os.path.basename(file_path)} ({num_anchors} anchors)")
+			successful += 1
+	
+	print(f"\n[blue]Summary:[/blue] {successful} successful, {failed} failed")
+	
+	# Write output if requested
+	if output_dir:
+		output_path = _Path(output_dir)
+		output_path.mkdir(parents=True, exist_ok=True)
+		
+		# Write metadata
+		metadata_file = output_path / "alignment_metadata.json"
+		with metadata_file.open("w", encoding="utf-8") as f:
+			json.dump(results, f, indent=2, default=str)
+		print(f"[green]Wrote alignment metadata to[/green] {metadata_file}")
+		
+		# Write transformed SRT files
+		for file_path, transform in results["transforms"].items():
+			if transform["type"] in ["identity", "piecewise_shift"]:
+				try:
+					# Load original segments
+					def load_segments(file_path: str):
+						p = _Path(file_path)
+						data = p.read_bytes()
+						ext = p.suffix.lower().lstrip(".")
+						if ext == "srt":
+							return parse_srt_bytes(data)
+						elif ext == "vtt":
+							return parse_vtt_bytes(data)
+						else:
+							raise ValueError(f"Unsupported extension: {ext}")
+					
+					original_segments = load_segments(file_path)
+					
+					if transform["type"] == "piecewise_shift":
+						# Apply transform
+						transformed_intervals = apply_piecewise_shift_to_intervals(
+							[(seg.start_seconds, seg.end_seconds) for seg in original_segments],
+							transform,
+						)
+						# Create new segments with transformed times
+						from .parsers.subtitles import Segment
+						transformed_segments = [
+							Segment(
+								start_seconds=new_start,
+								end_seconds=new_end,
+								text=original_segments[i].text
+							)
+							for i, (new_start, new_end) in enumerate(transformed_intervals)
+							if i < len(original_segments)
+						]
+					else:
+						# Identity transform - use original
+						transformed_segments = original_segments
+					
+					# Write transformed SRT
+					output_file = output_path / f"{_Path(file_path).stem}_aligned.srt"
+					
+					# Convert segments to SRT format and write
+					import srt
+					from datetime import timedelta
+					
+					srt_items = []
+					for i, seg in enumerate(transformed_segments):
+						start_td = timedelta(seconds=seg.start_seconds)
+						end_td = timedelta(seconds=seg.end_seconds)
+						srt_items.append(srt.Subtitle(
+							index=i+1,
+							start=start_td,
+							end=end_td,
+							content=seg.text
+						))
+					
+					with output_file.open("w", encoding="utf-8") as f:
+						f.write(srt.compose(srt_items))
+					
+					print(f"[green]Wrote aligned SRT to[/green] {output_file}")
+					
+				except Exception as e:
+					print(f"[red]Warning: Failed to write transformed SRT for {os.path.basename(file_path)}: {e}[/red]")
