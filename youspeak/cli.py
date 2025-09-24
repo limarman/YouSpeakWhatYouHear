@@ -30,6 +30,7 @@ from .analysis.alignment import (
     apply_piecewise_shift_to_intervals,
     select_master_clock_by_median_duration,
     align_multiple_subtitles_to_master,
+    compute_support_masks_for_component,
 )
 
 
@@ -213,6 +214,8 @@ def align_two_cmd(
     hardshift_threshold: float = typer.Option(0.9, help="Similarity threshold for hard anchors (center-to-center)"),
     write_transformed: str | None = typer.Option(None, help="Write transformed B subtitle (mapped to A's clock) to this .srt path using hard anchors"),
     merge_grow: bool = typer.Option(True, help="Use iterative grow-merge (absorb consecutive gaps while similarity improves)"),
+    show_mapping: bool = typer.Option(False, help="Include mapping explanation block in output (off by default)"),
+    show_anchors: bool = typer.Option(False, help="Include detailed hardshift output: anchors, boundaries, shifts (off by default)"),
 ) -> None:
     """Align two subtitle files by text with Needleman–Wunsch and print a simple table."""
     from pathlib import Path as _Path
@@ -432,7 +435,21 @@ def align_two_cmd(
                     "anchors": [],
                 }
             if emit_hardshift_transform:
-                print({"hardshift_transform": transform})
+                if show_anchors:
+                    print({"hardshift_transform": transform})
+                else:
+                    # Suppress detailed arrays by default
+                    print({
+                        "hardshift_transform": {
+                            "type": transform.get("type"),
+                            "from": transform.get("from"),
+                            "to": transform.get("to"),
+                            "threshold": transform.get("threshold"),
+                            "boundaries": f"{len(transform.get('boundaries', []))} boundaries (hidden)",
+                            "shifts": f"{len(transform.get('shifts', []))} shifts (hidden)",
+                            "anchors": f"{len(transform.get('anchors', []))} anchors (hidden)",
+                        }
+                    })
             if write_transformed and hard:
                 # Read full B segments with text
                 def load_segments(p: _Path):
@@ -474,20 +491,22 @@ def align_two_cmd(
                 idxs = sorted({int(round(k*(len(equations)-1)/(sample_n-1))) for k in range(sample_n)})
             else:
                 idxs = [0]
-            sample = [{
-                "i": int(i),
-                "x": round(float(equations[i]["x"]), 3),
-                "y": round(float(equations[i]["y"]), 3),
-                "w": (round(float(equations[i]["w"]), 3) if weight_pairs else 1.0),
-                "a_range": equations[i]["a_range"],
-                "b_range": equations[i]["b_range"],
-                "kind": equations[i]["kind"],
-            } for i in idxs]
-            print({
+            out = {
                 "affine": {"a": round(a, 6), "b": round(b, 6)},
                 "pairs": len(equations),
-                "equations_sample": sample,
-                "mapping": {
+            }
+            if show_mapping:
+                sample = [{
+                    "i": int(i),
+                    "x": round(float(equations[i]["x"]), 3),
+                    "y": round(float(equations[i]["y"]), 3),
+                    "w": (round(float(equations[i]["w"]), 3) if weight_pairs else 1.0),
+                    "a_range": equations[i]["a_range"],
+                    "b_range": equations[i]["b_range"],
+                    "kind": equations[i]["kind"],
+                } for i in idxs]
+                out["equations_sample"] = sample
+                out["mapping"] = {
                     "from": str(pa),
                     "to": str(pb),
                     "equation": f"t_to ≈ a * t_from + b",
@@ -495,8 +514,8 @@ def align_two_cmd(
                         "map_from_to": "t' = a*t + b",
                         "map_to_from": "t' = (t - b)/a",
                     },
-                },
-            })
+                }
+            print(out)
 
 
 @app.command(name="init-db")
@@ -729,7 +748,9 @@ def align_multiple_cmd(
 	precomputed: bool = typer.Option(True, help="Use precomputed hashed n-gram vectors (faster)"),
 	component_threshold: float = typer.Option(0.65, help="Edge threshold for largest connected component"),
 	hardshift_threshold: float = typer.Option(0.9, help="Similarity threshold for hard anchors"),
-	output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write aligned SRT files and metadata"),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write aligned SRT files and metadata"),
+    clean_unmatched: bool = typer.Option(False, help="Remove cues without any strong supporter in the component"),
+    clean_threshold: float = typer.Option(0.5, help="Block similarity threshold to count as support for cleaning"),
 ) -> None:
 	"""Align multiple subtitle files to a median-duration master clock using hard-anchor piecewise shifts."""
 	import os
@@ -816,6 +837,23 @@ def align_multiple_cmd(
 		min_sim=min_sim,
 		hardshift_threshold=hardshift_threshold,
 	)
+
+	# Optional cleaning step: compute per-cue support masks
+	support_info = None
+	if clean_unmatched:
+		print(f"[blue]Computing support masks with threshold {clean_threshold}...[/blue]")
+		support_info = compute_support_masks_for_component(
+			files,
+			component_indices,
+			n=n,
+			gap_penalty=gap_penalty,
+			min_sim=min_sim,
+			support_threshold=clean_threshold,
+		)
+		# Attach to metadata for export
+		results.setdefault("cleaning", {})
+		results["cleaning"]["threshold"] = clean_threshold
+		results["cleaning"]["support"] = support_info
 	
 	# Print summary
 	print("\n[green]Alignment Results:[/green]")
@@ -884,6 +922,12 @@ def align_multiple_cmd(
 					else:
 						# Identity transform - use original
 						transformed_segments = original_segments
+
+					# Optionally drop unsupported cues
+					if clean_unmatched and support_info is not None and file_path in support_info:
+						keep_mask = support_info[file_path]["keep_mask"]
+						if len(keep_mask) == len(transformed_segments):
+							transformed_segments = [seg for seg, keep in zip(transformed_segments, keep_mask) if keep]
 					
 					# Write transformed SRT
 					output_file = output_path / f"{_Path(file_path).stem}_aligned.srt"

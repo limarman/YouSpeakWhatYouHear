@@ -1511,3 +1511,94 @@ def align_multiple_subtitles_to_master(
 	return results
 
 
+
+
+def compute_support_masks_for_component(
+	subtitle_files: Sequence[str],
+	component_indices: Sequence[int],
+	*,
+	n: int = 3,
+	gap_penalty: float = -0.4,
+	min_sim: float = 0.3,
+	support_threshold: float = 0.5,
+) -> Dict[str, Dict[str, Any]]:
+	"""Compute simple per-cue support masks within a connected component.
+
+	A cue is kept if it belongs to any merged block with similarity >= support_threshold
+	against at least one other file in the component.
+	Returns a mapping: file_path -> {"keep_mask": List[bool], "kept_indices": List[int], "deleted_indices": List[int]}.
+	"""
+	from pathlib import Path as _Path
+	from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+
+	def load_segments_and_texts(file_path: str):
+		p = _Path(file_path)
+		data = p.read_bytes()
+		ext = p.suffix.lower().lstrip(".")
+		if ext == "srt":
+			segs = parse_srt_bytes(data)
+		elif ext == "vtt":
+			segs = parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+		texts = [normalize_subtitle_text(s.text or "") for s in segs]
+		return segs, texts
+
+	# Preload segments/texts for component
+	comp_files = [subtitle_files[i] for i in component_indices]
+	segments_list: List[List[Any]] = []
+	texts_list: List[List[str]] = []
+	for fp in comp_files:
+		segs, texts = load_segments_and_texts(fp)
+		segments_list.append(segs)
+		texts_list.append(texts)
+
+	# Initialize support masks
+	support_masks: List[List[bool]] = [[False] * len(segments_list[i]) for i in range(len(comp_files))]
+
+	# Pairwise matches across the component
+	for ai in range(len(comp_files)):
+		for bi in range(ai + 1, len(comp_files)):
+			A_texts = texts_list[ai]
+			B_texts = texts_list[bi]
+			if not A_texts or not B_texts:
+				continue
+			# Align and merge
+			aligned_pairs, S = needleman_wunsch_align(
+				A_texts,
+				B_texts,
+				n=n,
+				gap_penalty=gap_penalty,
+				min_sim=min_sim,
+			)
+			blocks = compute_match_blocks_growmerge(
+				aligned_pairs,
+				S,
+				A_texts,
+				B_texts,
+				n=n,
+			)
+			# Mark support from strong blocks
+			for (i0, i1), (j0, j1), sc in blocks:
+				if float(sc) >= support_threshold:
+					for i in range(max(0, i0), min(i1 + 1, len(support_masks[ai]))):
+						support_masks[ai][i] = True
+					for j in range(max(0, j0), min(j1 + 1, len(support_masks[bi]))):
+						support_masks[bi][j] = True
+
+	# Build result mapping
+	result: Dict[str, Dict[str, Any]] = {}
+	for local_idx, fp in enumerate(comp_files):
+		mask = support_masks[local_idx]
+		kept = [i for i, keep in enumerate(mask) if keep]
+		deleted = [i for i, keep in enumerate(mask) if not keep]
+		result[fp] = {
+			"keep_mask": mask,
+			"kept_indices": kept,
+			"deleted_indices": deleted,
+			"total_cues": len(mask),
+			"kept_count": len(kept),
+			"deleted_count": len(deleted),
+		}
+
+	return result
