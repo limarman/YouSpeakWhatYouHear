@@ -3,6 +3,7 @@
 Primary Commands:
   - align-pair: Align two subtitle files using NW + grow-merge
   - align-pipeline: Full pipeline with normalization, alignment, and cleaning
+  - consensus: Compute speech time consensus from multiple subtitle files
   - preview-html: Generate HTML preview of subtitles
   - init-db, list, ingest-subtitle: Database operations
   - fetch-subliminal-candidates: Fetch subtitle candidates from subliminal search
@@ -558,3 +559,134 @@ def align_pipeline_cmd(
 			print(f"[green]Wrote aligned SRT to[/green] {output_file}")
 	
 	print("\n[green]Pipeline complete![/green]")
+
+
+@app.command(name="consensus")
+def consensus_cmd(
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) for consensus"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	target_agreement_pct: float = typer.Option(0.66, help="Target agreement percentage (0.0-1.0)"),
+	max_agreement_pct: float = typer.Option(0.75, help="Maximum agreement percentage cap (0.0-1.0)"),
+	merge_micro_gaps: bool = typer.Option(True, help="Merge small gaps between intervals"),
+	micro_gap_seconds: float = typer.Option(0.2, help="Maximum gap size to merge (seconds)"),
+	min_interval_seconds: float = typer.Option(0.3, help="Minimum interval duration to keep (seconds)"),
+	output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write consensus SRT and metadata"),
+	show_metadata: bool = typer.Option(True, help="Show consensus metadata"),
+) -> None:
+	"""Compute speech time consensus from multiple subtitle files."""
+	from pathlib import Path as _Path
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .analysis.consensus import compute_consensus, export_consensus_srt, ConsensusConfig
+	from .util.types import Subtitle
+	
+	# Collect files
+	paths: list[_Path] = []
+	if dir:
+		d = _Path(dir)
+		if not d.is_dir():
+			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
+		if recursive:
+			for p in sorted(d.rglob("*")):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+		else:
+			for p in sorted(d.iterdir()):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+	if files:
+		paths.extend([_Path(f) for f in files])
+	
+	# De-duplicate
+	seen = set()
+	unique_paths: list[_Path] = []
+	for p in paths:
+		if str(p) not in seen:
+			seen.add(str(p))
+			unique_paths.append(p)
+	paths = unique_paths
+	
+	if len(paths) < 1:
+		raise typer.BadParameter("Provide at least one subtitle file via arguments or --dir")
+	
+	print(f"[blue]Found {len(paths)} subtitle files[/blue]")
+	
+	# Load subtitles
+	def load_subtitle(file_path: _Path) -> Subtitle:
+		data = file_path.read_bytes()
+		ext = file_path.suffix.lower().lstrip(".")
+		if ext == "srt":
+			segs = parse_srt_bytes(data)
+		elif ext == "vtt":
+			segs = parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+		
+		subtitle = Subtitle(
+			source_file=str(file_path),
+			intervals=[(s.start_seconds, s.end_seconds) for s in segs],
+			texts=[s.text or "" for s in segs],
+			original_texts=None
+		)
+		return subtitle
+	
+	print("[blue]Loading subtitles...[/blue]")
+	subtitles = [load_subtitle(p) for p in paths]
+	print(f"[green]Loaded {len(subtitles)} subtitles[/green]")
+	for i, subtitle in enumerate(subtitles):
+		print(f"  • {paths[i].name}: {len(subtitle.intervals)} cues")
+	
+	# Configure consensus
+	config = ConsensusConfig(
+		target_agreement_pct=target_agreement_pct,
+		max_agreement_pct=max_agreement_pct,
+		merge_micro_gaps=merge_micro_gaps,
+		micro_gap_seconds=micro_gap_seconds,
+		min_interval_seconds=min_interval_seconds
+	)
+	
+	# Compute consensus
+	print("\n[blue]Computing consensus...[/blue]")
+	consensus_subtitle, speech_seconds, metadata = compute_consensus(subtitles, config)
+	
+	# Extract info from metadata for display
+	consensus_meta = metadata.get("consensus", {})
+	num_intervals = consensus_meta.get("num_intervals", 0)
+	total_subtitles = consensus_meta.get("total_subtitles", 0)
+	required_agreement = consensus_meta.get("required_agreement", 0)
+	agreement_percentage = consensus_meta.get("agreement_percentage", 0.0)
+	
+	# Compute speech minutes from metric
+	speech_minutes = speech_seconds / 60.0
+	
+	# Display results
+	print("\n[green]Consensus Results:[/green]")
+	print(f"  Speech Time: {speech_seconds:.2f} seconds ({speech_minutes:.2f} minutes)")
+	print(f"  Speech Intervals: {num_intervals}")
+	print(f"  Total Subtitles: {total_subtitles}")
+	print(f"  Required Agreement: {required_agreement}/{total_subtitles} ({agreement_percentage:.1f}%)")
+	
+	# Show metadata
+	if show_metadata:
+		print("\n[yellow]Consensus Metadata:[/yellow]")
+		print(json.dumps(metadata, indent=2, default=str))
+	
+	# Write output
+	if output_dir:
+		output_path = _Path(output_dir)
+		output_path.mkdir(parents=True, exist_ok=True)
+		
+		# Write metadata
+		metadata_file = output_path / "consensus_metadata.json"
+		with metadata_file.open("w", encoding="utf-8") as f:
+			json.dump(metadata, f, indent=2, default=str)
+		print(f"\n[green]Wrote metadata to[/green] {metadata_file}")
+		
+		# Write consensus SRT
+		consensus_srt_file = output_path / "consensus.srt"
+		consensus_srt = export_consensus_srt(consensus_subtitle)
+		with consensus_srt_file.open("w", encoding="utf-8") as f:
+			f.write(consensus_srt)
+		print(f"[green]Wrote consensus SRT to[/green] {consensus_srt_file}")
+	
+	print("\n[green]Consensus computation complete![/green]")

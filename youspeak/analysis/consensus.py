@@ -1,176 +1,240 @@
-"""Consensus timeline (k-of-n) across multiple subtitle candidates.
+"""Consensus timeline computation across multiple subtitle candidates.
 
-Takes multiple subtitle files, normalizes segments, merges micro-gaps per
-candidate, then computes a consensus timeline where at least k candidates are
-"speaking". Outputs merged consensus intervals and basic stats.
+Takes multiple subtitle objects and computes a consensus timeline where a threshold
+percentage of subtitles agree that speech is happening. Uses line-scan algorithm
+to efficiently compute speech intervals.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-from .speech import _merge_intervals
-from .alignment import align_intervals
-from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, Segment
+from youspeak.util.types import Subtitle
 
 
 @dataclass
-class ConsensusResult:
-	intervals: List[Tuple[float, float]]
-	num_candidates: int
-	k: int
-	speech_seconds: float
-	speech_minutes: float
-	shifts: Optional[List[float]] = None
+class ConsensusConfig:
+    """Configuration for consensus computation."""
+    target_agreement_pct: float = 0.66  # Target 66% agreement (2/3 majority)
+    max_agreement_pct: float = 0.75     # Cap at 75% to avoid being too strict
+    merge_micro_gaps: bool = True
+    micro_gap_seconds: float = 0.2
+    min_interval_seconds: float = 0.3
 
 
-def _load_segments_from_path(path: Path) -> List[Segment]:
-	data = path.read_bytes()
-	ext = path.suffix.lower().lstrip(".")
-	if ext == "srt":
-		return parse_srt_bytes(data)
-	elif ext == "vtt":
-		return parse_vtt_bytes(data)
-	else:
-		raise ValueError(f"Unsupported ext: {ext}")
+def _compute_threshold_k(n: int, target_pct: float, max_pct: float) -> int:
+    """Compute optimal k threshold for n subtitles.
+    
+    Strategy:
+    - Target target_pct agreement (e.g., 66% for 2/3 majority)
+    - Cap at max_pct to avoid being too strict with many subtitles
+    
+    Args:
+        n: Number of subtitles
+        target_pct: Target agreement percentage (0.0 to 1.0)
+        max_pct: Maximum agreement percentage cap (0.0 to 1.0)
+        
+    Returns:
+        Number of subtitles that must agree (k)
+    """
+    if n <= 0:
+        return 0
+    
+    # Target desired percentage
+    k = math.ceil(n * target_pct)
+    
+    # Cap at maximum percentage
+    if k / n > max_pct:
+        k = math.floor(n * max_pct)
+    
+    # Ensure at least 1
+    return max(1, k)
 
 
-def _segments_to_intervals(segments: Sequence[Segment]) -> List[Tuple[float, float]]:
-	return [(s.start_seconds, s.end_seconds) for s in segments if s.end_seconds > s.start_seconds]
+def _merge_intervals(
+    intervals: List[Tuple[float, float]],
+    micro_gap_seconds: float = 0.2,
+) -> List[Tuple[float, float]]:
+    """Merge overlapping or near-adjacent intervals.
+    
+    Args:
+        intervals: List of (start, end) tuples
+        micro_gap_seconds: Gaps smaller than this are merged
+        
+    Returns:
+        Merged list of intervals
+    """
+    if not intervals:
+        return []
+    
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged: List[Tuple[float, float]] = []
+    cur_start, cur_end = intervals[0]
+    
+    for start, end in intervals[1:]:
+        if start <= cur_end + micro_gap_seconds:
+            # Overlap or near-adjacent (micro-gap)
+            if end > cur_end:
+                cur_end = end
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = start, end
+    
+    merged.append((cur_start, cur_end))
+    return merged
 
 
 def compute_consensus(
-	paths: Sequence[Path],
-	*,
-	k: int,
-	micro_gap_seconds: float = 0.2,
-	min_interval_seconds: float = 0.3,
-	align_before_consensus: bool = False,
-	align_dt: float = 0.1,
-	align_max_lag_seconds: float = 300.0,
-) -> ConsensusResult:
-	"""Compute k-of-n consensus intervals from multiple subtitle files."""
-	if not paths:
-		raise ValueError("No subtitle files provided")
-	if k < 1 or k > len(paths):
-		raise ValueError("k must be between 1 and number of paths")
+    subtitles: List[Subtitle],
+    config: ConsensusConfig,
+    metadata: Optional[Dict[str, Any]] = None
+) -> Tuple[Subtitle, float, Dict[str, Any]]:
+    """Compute consensus timeline from multiple subtitle objects.
+    
+    Uses a line-scan algorithm to find time intervals where a threshold percentage
+    of subtitles agree that speech is happening.
+    
+    Args:
+        subtitles: List of subtitle objects to analyze
+        config: Consensus computation configuration
+        metadata: Optional metadata dict to update
+        
+    Returns:
+        Tuple of:
+        - Consensus subtitle with merged intervals (empty text content)
+        - Speech time in seconds (float)
+        - Updated metadata dict
+    """
+    if metadata is None:
+        metadata = {}
+    
+    n = len(subtitles)
+    if n == 0:
+        raise ValueError("No subtitles provided")
+    
+    # Compute optimal k threshold
+    k = _compute_threshold_k(n, config.target_agreement_pct, config.max_agreement_pct)
+    
+    # Extract intervals from each subtitle
+    per_subtitle_intervals: List[List[Tuple[float, float]]] = []
+    for subtitle in subtitles:
+        intervals = [(start, end) for start, end in subtitle.intervals if end > start]
+        
+        # Optionally merge micro-gaps per subtitle first
+        if config.merge_micro_gaps:
+            intervals = _merge_intervals(intervals, config.micro_gap_seconds)
+        
+        per_subtitle_intervals.append(intervals)
+    
+    # Line-scan algorithm: create events for all interval boundaries
+    events: List[Tuple[float, int]] = []  # (time, +1 for start / -1 for end)
+    for intervals in per_subtitle_intervals:
+        for start, end in intervals:
+            events.append((start, +1))
+            events.append((end, -1))
+    
+    if not events:
+        # No speech detected in any subtitle
+        consensus_subtitle = Subtitle(
+            source_file="consensus",
+            intervals=[],
+            texts=[],
+            original_texts=None
+        )
+        
+        metadata["consensus"] = {
+            "config": config.__dict__.copy(),
+            "total_subtitles": n,
+            "required_agreement": k,
+            "agreement_percentage": round(k / n * 100, 2) if n > 0 else 0.0,
+            "num_intervals": 0
+        }
+        
+        return consensus_subtitle, 0.0, metadata
+    
+    # Sort events: starts before ends at same timestamp
+    events.sort(key=lambda x: (x[0], -x[1]))
+    
+    # Sweep through events and track coverage count
+    consensus_raw: List[Tuple[float, float]] = []
+    coverage = 0
+    current_start: Optional[float] = None
+    
+    for time, delta in events:
+        prev_coverage = coverage
+        coverage += delta
+        
+        # Entering consensus region (coverage reaches k)
+        if prev_coverage < k and coverage >= k:
+            current_start = time
+        
+        # Leaving consensus region (coverage drops below k)
+        elif prev_coverage >= k and coverage < k:
+            if current_start is not None and time > current_start:
+                consensus_raw.append((current_start, time))
+                current_start = None
+    
+    # Post-process: merge micro-gaps and filter short intervals
+    if config.merge_micro_gaps:
+        consensus_merged = _merge_intervals(consensus_raw, config.micro_gap_seconds)
+    else:
+        consensus_merged = consensus_raw
+    
+    consensus_filtered = [
+        (start, end) 
+        for start, end in consensus_merged 
+        if (end - start) >= config.min_interval_seconds
+    ]
+    
+    # Compute speech time
+    total_seconds = sum(end - start for start, end in consensus_filtered)
+    speech_seconds = round(total_seconds, 3)
+    
+    # Create consensus subtitle (with empty texts)
+    consensus_subtitle = Subtitle(
+        source_file="consensus",
+        intervals=consensus_filtered,
+        texts=["" for _ in consensus_filtered],
+        original_texts=None
+    )
+    
+    # Update metadata
+    metadata["consensus"] = {
+        "config": config.__dict__.copy(),
+        "total_subtitles": n,
+        "required_agreement": k,
+        "agreement_percentage": round(k / n * 100, 2) if n > 0 else 0.0,
+        "num_intervals": len(consensus_filtered)
+    }
+    
+    return consensus_subtitle, speech_seconds, metadata
 
-	# 1) Load and pre-merge per candidate
-	per_candidate: List[List[Tuple[float, float]]] = []
-	for p in paths:
-		segments = _load_segments_from_path(p)
-		intervals = _segments_to_intervals(segments)
-		merged = _merge_intervals(intervals, micro_gap_seconds=micro_gap_seconds)
-		per_candidate.append(merged)
 
-	# Optional: align candidates by simple FFT lag + unweighted LS
-	shifts_list: Optional[List[float]] = None
-	if align_before_consensus and len(per_candidate) >= 2:
-		aligned_intervals, _shifts = align_intervals(
-			per_candidate,
-			dt=align_dt,
-			max_lag_seconds=align_max_lag_seconds,
-		)
-		per_candidate = aligned_intervals
-		shifts_list = [float(x) for x in _shifts.tolist()]
-
-	# 2) Line sweep over all boundaries with coverage counting
-	events: List[Tuple[float, int]] = []  # (time, +1 start / -1 end)
-	for intervals in per_candidate:
-		for s, e in intervals:
-			events.append((s, +1))
-			events.append((e, -1))
-	if not events:
-		return ConsensusResult(intervals=[], num_candidates=len(paths), k=k, speech_seconds=0.0, speech_minutes=0.0, shifts=shifts_list)
-	events.sort(key=lambda x: (x[0], -x[1]))  # starts before ends at same timestamp
-
-	consensus_raw: List[Tuple[float, float]] = []
-	coverage = 0
-	current_start: float | None = None
-	for t, delta in events:
-		prev_coverage = coverage
-		coverage += delta
-		# entering consensus region
-		if prev_coverage < k and coverage >= k:
-			current_start = t
-		# leaving consensus region
-		elif prev_coverage >= k and coverage < k:
-			if current_start is not None and t > current_start:
-				consensus_raw.append((current_start, t))
-				current_start = None
-
-	# 3) Post-process consensus: merge micro-gaps and filter short intervals
-	consensus_merged = _merge_intervals(consensus_raw, micro_gap_seconds=micro_gap_seconds)
-	consensus_filtered = [(s, e) for s, e in consensus_merged if (e - s) >= min_interval_seconds]
-	total_seconds = sum(e - s for s, e in consensus_filtered)
-	return ConsensusResult(
-		intervals=consensus_filtered,
-		num_candidates=len(paths),
-		k=k,
-		speech_seconds=float(total_seconds),
-		speech_minutes=float(total_seconds / 60.0),
-		shifts=shifts_list,
-	)
-
-
-def export_srt(intervals: Sequence[Tuple[float, float]]) -> str:
-	"""Generate a minimal SRT string from intervals with '-' as placeholder text."""
-	def fmt(ts: float) -> str:
-		ms = int(round((ts - int(ts)) * 1000))
-		sec = int(ts) % 60
-		minute = (int(ts) // 60) % 60
-		hour = int(ts) // 3600
-		return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
-
-	lines: List[str] = []
-	for i, (s, e) in enumerate(intervals, 1):
-		lines.append(str(i))
-		lines.append(f"{fmt(s)} --> {fmt(e)}")
-		lines.append("-")
-		lines.append("")
-	return "\n".join(lines)
-
-
-def export_anchored_srt(
-	paths: Sequence[Path],
-	intervals: Sequence[Tuple[float, float]],
-	*,
-	anchor_index: int = 0,
-	min_overlap_seconds: float = 0.05,
-) -> str:
-	"""Export consensus intervals as SRT using text from the anchor subtitle file.
-
-	- The anchor is chosen by ``anchor_index`` in ``paths`` (default first file)
-	- For each consensus interval, join texts of anchor cues that overlap the
-	  interval by at least ``min_overlap_seconds``; fallback to '-' if none
-	"""
-	anchor_segments = _load_segments_from_path(paths[anchor_index])
-
-	def fmt(ts: float) -> str:
-		ms = int(round((ts - int(ts)) * 1000))
-		sec = int(ts) % 60
-		minute = (int(ts) // 60) % 60
-		hour = int(ts) // 3600
-		return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
-
-	def overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-		start = max(a[0], b[0])
-		end = min(a[1], b[1])
-		return max(0.0, end - start)
-
-	lines: List[str] = []
-	for i, (s, e) in enumerate(intervals, 1):
-		texts: List[str] = []
-		for seg in anchor_segments:
-			ov = overlap((s, e), (seg.start_seconds, seg.end_seconds))
-			if ov >= min_overlap_seconds:
-				if seg.text:
-					texts.append(seg.text)
-		joined = " ".join(texts).strip() if texts else "-"
-		lines.append(str(i))
-		lines.append(f"{fmt(s)} --> {fmt(e)}")
-		lines.append(joined)
-		lines.append("")
-	return "\n".join(lines)
+def export_consensus_srt(consensus_subtitle: Subtitle, placeholder_text: str = "-") -> str:
+    """Export consensus subtitle as SRT format with placeholder text.
+    
+    Args:
+        consensus_subtitle: Consensus subtitle with intervals
+        placeholder_text: Text to use for each cue (default: "-")
+        
+    Returns:
+        SRT formatted string
+    """
+    def fmt_timestamp(ts: float) -> str:
+        """Format seconds as SRT timestamp (HH:MM:SS,mmm)."""
+        ms = int(round((ts - int(ts)) * 1000))
+        sec = int(ts) % 60
+        minute = (int(ts) // 60) % 60
+        hour = int(ts) // 3600
+        return f"{hour:02d}:{minute:02d}:{sec:02d},{ms:03d}"
+    
+    lines: List[str] = []
+    for i, (start, end) in enumerate(consensus_subtitle.intervals, 1):
+        lines.append(str(i))
+        lines.append(f"{fmt_timestamp(start)} --> {fmt_timestamp(end)}")
+        lines.append(placeholder_text)
+        lines.append("")
+    
+    return "\n".join(lines)
