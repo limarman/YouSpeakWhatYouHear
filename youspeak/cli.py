@@ -171,7 +171,7 @@ def align_pair_cmd(
 	from pathlib import Path as _Path
 	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
 	from .analysis.normalization import normalize_subtitle, NormalizationConfig
-	from .analysis.alignment_new import _needleman_wunsch_align, _compute_blocks_growmerge, BlockAlignmentConfig
+	from .analysis.alignment import _needleman_wunsch_align, _compute_blocks_growmerge, BlockAlignmentConfig
 	from .util.types import Subtitle, BlockAlignment
 	
 	# Load and normalize subtitles
@@ -357,7 +357,7 @@ def align_pipeline_cmd(
 	from pathlib import Path as _Path
 	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
 	from .analysis.normalization import normalize_subtitle, NormalizationConfig
-	from .analysis.alignment_new import (
+	from .analysis.alignment import (
 		align_subtitle_matrix, 
 		select_candidates,
 		align_to_master,
