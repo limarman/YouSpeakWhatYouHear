@@ -6,7 +6,7 @@ normalization and alignment pipeline.
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 @dataclass
@@ -21,12 +21,15 @@ class Subtitle:
         source_file: Path or identifier of the original subtitle file
         intervals: List of (start_seconds, end_seconds) timing pairs
         texts: List of text content for each subtitle cue
+        original_texts: Optional original text before normalization (metadata passthrough)
         
     Invariant: len(intervals) == len(texts)
+    Invariant: if original_texts is not None, len(original_texts) == len(texts)
     """
     source_file: str
     intervals: List[Tuple[float, float]]  # (start_seconds, end_seconds)
     texts: List[str]
+    original_texts: Optional[List[str]] = None
 
 
 @dataclass  

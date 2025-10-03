@@ -748,29 +748,40 @@ def clean_subtitle(
     # Filter to keep only supported cues
     cleaned_intervals = []
     cleaned_texts = []
+    cleaned_original_texts = [] if subtitle.original_texts else None
     removed_indices = []
     
     for i in range(num_cues):
         if has_support[i]:
             cleaned_intervals.append(subtitle.intervals[i])
             cleaned_texts.append(subtitle.texts[i])
+            if subtitle.original_texts:
+                cleaned_original_texts.append(subtitle.original_texts[i])
         else:
             removed_indices.append(i)
     
     # Sort by start time to maintain chronological order
     # (Cleaning may have removed cues, but remaining ones should stay in time order)
     if cleaned_intervals:
-        # Create list of (start_time, interval, text) tuples, sort, then unzip
-        combined = list(zip([interval[0] for interval in cleaned_intervals], cleaned_intervals, cleaned_texts))
-        combined.sort(key=lambda x: x[0])  # Sort by start time
-        cleaned_intervals = [item[1] for item in combined]
-        cleaned_texts = [item[2] for item in combined]
+        # Create list of (start_time, interval, text, original_text) tuples, sort, then unzip
+        if subtitle.original_texts:
+            combined = list(zip([interval[0] for interval in cleaned_intervals], cleaned_intervals, cleaned_texts, cleaned_original_texts))
+            combined.sort(key=lambda x: x[0])  # Sort by start time
+            cleaned_intervals = [item[1] for item in combined]
+            cleaned_texts = [item[2] for item in combined]
+            cleaned_original_texts = [item[3] for item in combined]
+        else:
+            combined = list(zip([interval[0] for interval in cleaned_intervals], cleaned_intervals, cleaned_texts))
+            combined.sort(key=lambda x: x[0])  # Sort by start time
+            cleaned_intervals = [item[1] for item in combined]
+            cleaned_texts = [item[2] for item in combined]
     
     # Create cleaned subtitle
     cleaned_subtitle = Subtitle(
         source_file=subtitle.source_file,
         intervals=cleaned_intervals,
-        texts=cleaned_texts
+        texts=cleaned_texts,
+        original_texts=cleaned_original_texts
     )
     
     # Update metadata
@@ -1042,7 +1053,8 @@ def _apply_piecewise_shift(
     return Subtitle(
         source_file=subtitle.source_file,
         intervals=new_intervals,
-        texts=list(subtitle.texts)
+        texts=list(subtitle.texts),
+        original_texts=subtitle.original_texts  # Pass through as-is
     )
 
 

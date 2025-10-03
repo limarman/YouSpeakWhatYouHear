@@ -206,7 +206,8 @@ def normalize_subtitle(
     normalized_subtitle = Subtitle(
         source_file=subtitle.source_file,
         intervals=subtitle.intervals.copy(),  # Keep original timing
-        texts=normalized_texts
+        texts=normalized_texts,
+        original_texts=subtitle.original_texts  # Pass through as-is
     )
     
     # Track per-file stats (no config duplication)

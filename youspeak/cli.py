@@ -186,11 +186,15 @@ def align_pair_cmd(
 		else:
 			raise typer.BadParameter(f"Unsupported extension: {ext}")
 		
-		# Create subtitle object
+		# Capture original texts before normalization
+		original_texts = [s.text or "" for s in segs]
+		
+		# Create subtitle object with original texts
 		subtitle = Subtitle(
 			source_file=str(p),
 			intervals=[(s.start_seconds, s.end_seconds) for s in segs],
-			texts=[s.text or "" for s in segs]
+			texts=[s.text or "" for s in segs],
+			original_texts=original_texts
 		)
 		
 		# Normalize
@@ -409,10 +413,14 @@ def align_pipeline_cmd(
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		
+		# Capture original texts before normalization
+		original_texts = [s.text or "" for s in segs]
+		
 		subtitle = Subtitle(
 			source_file=str(file_path),
 			intervals=[(s.start_seconds, s.end_seconds) for s in segs],
-			texts=[s.text or "" for s in segs]
+			texts=[s.text or "" for s in segs],
+			original_texts=original_texts
 		)
 		
 		norm_config = NormalizationConfig()
@@ -530,6 +538,9 @@ def align_pipeline_cmd(
 			subtitle = final_subtitles[i]
 			output_file = output_path / f"{_Path(subtitle.source_file).stem}_aligned.srt"
 			
+			# Use original_texts if available, otherwise fall back to normalized texts
+			output_texts = subtitle.original_texts if subtitle.original_texts else subtitle.texts
+			
 			srt_items = []
 			for j, (start, end) in enumerate(subtitle.intervals):
 				start_td = timedelta(seconds=start)
@@ -538,7 +549,7 @@ def align_pipeline_cmd(
 					index=j+1,
 					start=start_td,
 					end=end_td,
-					content=subtitle.texts[j]
+					content=output_texts[j]
 				))
 			
 			with output_file.open("w", encoding="utf-8") as f:
