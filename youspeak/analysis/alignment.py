@@ -715,11 +715,27 @@ def clean_subtitle(
     
     Conservative approach: Keep a cue if it has ANY block match with similarity
     >= support_threshold in any of the supporting alignments.
+    
+    If there are no supporting alignments (single file case), all cues are kept.
     """
     if metadata is None:
         metadata = {}
     
     num_cues = len(subtitle.texts)
+    
+    # Special case: if there are no supporting alignments (single file case),
+    # keep all cues - there's nothing to compare against
+    if not supporting_alignments:
+        metadata.setdefault("cleaning", {}).update({
+            "support_threshold": support_threshold,
+            "supporting_alignments": 0,
+            "original_cues": num_cues,
+            "cleaned_cues": num_cues,
+            "removed_cues": 0,
+            "removed_indices": [],
+            "note": "No cleaning performed - single file with no supporting alignments"
+        })
+        return subtitle, metadata
     
     # Initialize support mask - all cues are unsupported by default
     has_support = [False] * num_cues

@@ -4,6 +4,7 @@ Primary Commands:
   - align-pair: Align two subtitle files using NW + grow-merge
   - align-pipeline: Full pipeline with normalization, alignment, and cleaning
   - consensus: Compute speech time consensus from multiple subtitle files
+  - tokenize: Extract tokens from a subtitle file for speech speed analysis
   - preview-html: Generate HTML preview of subtitles
   - init-db, list, ingest-subtitle: Database operations
   - fetch-subliminal-candidates: Fetch subtitle candidates from subliminal search
@@ -559,6 +560,204 @@ def align_pipeline_cmd(
 			print(f"[green]Wrote aligned SRT to[/green] {output_file}")
 	
 	print("\n[green]Pipeline complete![/green]")
+
+
+@app.command(name="tokenize")
+def tokenize_cmd(
+	files: list[str] | None = typer.Argument(None, help="Subtitle file(s) (.srt/.vtt) to tokenize"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing subtitle files"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	language: str | None = typer.Option(None, "--lang", help="Language code for tokenization (e.g., en, es, de). If not specified, language will be auto-detected."),
+	already_normalized: bool = typer.Option(False, help="Skip normalization if already normalized"),
+	show_tokens: bool = typer.Option(False, help="Display the extracted tokens (only for single file)"),
+	show_metadata: bool = typer.Option(True, help="Show tokenization metadata"),
+) -> None:
+	"""Extract tokens from subtitle file(s) for speech speed analysis."""
+	from pathlib import Path as _Path
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .analysis.tokens import tokenize_subtitle, tokenize_subtitles
+	from .util.types import Subtitle
+	from rich.table import Table as _Table
+	
+	# Collect files
+	paths: list[_Path] = []
+	if dir:
+		d = _Path(dir)
+		if not d.is_dir():
+			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
+		if recursive:
+			for p in sorted(d.rglob("*")):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+		else:
+			for p in sorted(d.iterdir()):
+				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+					paths.append(p)
+	if files:
+		paths.extend([_Path(f) for f in files])
+	
+	# De-duplicate
+	seen = set()
+	unique_paths: list[_Path] = []
+	for p in paths:
+		if str(p) not in seen:
+			seen.add(str(p))
+			unique_paths.append(p)
+	paths = unique_paths
+	
+	if len(paths) == 0:
+		raise typer.BadParameter("Provide subtitle file(s) via arguments or --dir")
+	
+	print(f"[blue]Found {len(paths)} subtitle file(s)[/blue]")
+	
+	# Load subtitle files
+	def load_subtitle(file_path: _Path) -> Subtitle:
+		data = file_path.read_bytes()
+		ext = file_path.suffix.lower().lstrip(".")
+		if ext == "srt":
+			segs = parse_srt_bytes(data)
+		elif ext == "vtt":
+			segs = parse_vtt_bytes(data)
+		else:
+			raise ValueError(f"Unsupported extension: {ext}")
+		
+		subtitle = Subtitle(
+			source_file=str(file_path),
+			intervals=[(s.start_seconds, s.end_seconds) for s in segs],
+			texts=[s.text or "" for s in segs],
+			original_texts=None
+		)
+		return subtitle
+	
+	print("[blue]Loading subtitle files...[/blue]")
+	subtitles = [load_subtitle(p) for p in paths]
+	print(f"[green]Loaded {len(subtitles)} subtitle(s)[/green]")
+	
+	# Single file mode
+	if len(subtitles) == 1:
+		subtitle = subtitles[0]
+		
+		# Tokenize
+		if language:
+			print(f"[blue]Tokenizing (language={language}, already_normalized={already_normalized})...[/blue]")
+		else:
+			print(f"[blue]Auto-detecting language and tokenizing (already_normalized={already_normalized})...[/blue]")
+		
+		metadata = {}
+		tokens, detected_lang = tokenize_subtitle(
+			subtitle,
+			already_normalized=already_normalized,
+			language=language,
+			metadata=metadata
+		)
+		
+		# Extract detection method for display
+		detection_method = metadata.get("tokenization", {}).get("language_detection", "unknown")
+		
+		# Display results
+		print(f"\n[green]Tokenization complete![/green]")
+		if detection_method == "automatic":
+			print(f"  Detected language: {detected_lang}")
+		elif detection_method == "automatic_fallback":
+			print(f"  Language detection failed, using fallback: {detected_lang}")
+		elif detection_method == "manual":
+			print(f"  Language (manual): {detected_lang}")
+		print(f"  Total tokens: {len(tokens)}")
+		print(f"  Unique tokens: {len(set(tokens))}")
+		
+		if show_tokens:
+			print(f"\n[yellow]Tokens:[/yellow]")
+			# Display tokens in a readable format (wrap at 80 chars)
+			line = ""
+			for token in tokens:
+				if len(line) + len(token) + 2 > 80:
+					print(f"  {line}")
+					line = token
+				else:
+					if line:
+						line += ", " + token
+					else:
+						line = token
+			if line:
+				print(f"  {line}")
+		
+		if show_metadata:
+			print(f"\n[yellow]Metadata:[/yellow]")
+			print(json.dumps(metadata, indent=2, default=str))
+	
+	# Batch mode
+	else:
+		# Tokenize all subtitles
+		if language:
+			print(f"[blue]Tokenizing (language={language}, already_normalized={already_normalized})...[/blue]")
+		else:
+			print(f"[blue]Auto-detecting language and tokenizing (already_normalized={already_normalized})...[/blue]")
+		
+		metadata = {}
+		all_tokens, majority_lang, metadata = tokenize_subtitles(
+			subtitles,
+			already_normalized=already_normalized,
+			language=language,
+			metadata=metadata
+		)
+		
+		# Display results
+		print(f"\n[green]Tokenization complete![/green]")
+		
+		# Show language agreement if auto-detected
+		if language is None and "language_agreement" in metadata.get("tokenization", {}):
+			lang_agreement = metadata["tokenization"]["language_agreement"]
+			print(f"\n[yellow]Language Detection:[/yellow]")
+			print(f"  Majority language: {lang_agreement['majority_language']}")
+			print(f"  Agreement: {lang_agreement['agreement_count']}/{lang_agreement['total_subtitles']} ({lang_agreement['agreement_percentage']:.1f}%)")
+			
+			# Show distribution if there are multiple languages
+			lang_dist = lang_agreement['language_distribution']
+			if len(lang_dist) > 1:
+				print(f"  Language distribution:")
+				for lang, count in sorted(lang_dist.items(), key=lambda x: x[1], reverse=True):
+					print(f"    {lang}: {count} file(s)")
+		elif language:
+			print(f"  Language (manual): {majority_lang}")
+		
+		# Create table with per-file stats
+		table = _Table(title=f"Tokenization Results ({len(subtitles)} files)")
+		table.add_column("File")
+		table.add_column("Cues", justify="right")
+		table.add_column("Tokens", justify="right")
+		table.add_column("Unique", justify="right")
+		table.add_column("Lang")
+		
+		file_stats = metadata.get("tokenization", {}).get("files", {})
+		for i, (p, tokens) in enumerate(zip(paths, all_tokens)):
+			file_key = str(p)
+			stats = file_stats.get(file_key, {})
+			cues = stats.get("total_cues", 0)
+			total_tokens = len(tokens)
+			unique_tokens = len(set(tokens))
+			detected_lang = stats.get("detected_language", "?")
+			
+			table.add_row(
+				p.name,
+				str(cues),
+				str(total_tokens),
+				str(unique_tokens),
+				detected_lang
+			)
+		
+		print(f"\n{table}")
+		
+		# Show summary stats
+		total_tokens = sum(len(tokens) for tokens in all_tokens)
+		total_unique = len(set(token for tokens in all_tokens for token in tokens))
+		print(f"\n[yellow]Summary:[/yellow]")
+		print(f"  Total files: {len(subtitles)}")
+		print(f"  Total tokens: {total_tokens}")
+		print(f"  Total unique tokens: {total_unique}")
+		
+		if show_metadata:
+			print(f"\n[yellow]Metadata:[/yellow]")
+			print(json.dumps(metadata, indent=2, default=str))
 
 
 @app.command(name="consensus")
