@@ -570,12 +570,19 @@ def tokenize_cmd(
 	language: str | None = typer.Option(None, "--lang", help="Language code for tokenization (e.g., en, es, de). If not specified, language will be auto-detected."),
 	already_normalized: bool = typer.Option(False, help="Skip normalization if already normalized"),
 	show_tokens: bool = typer.Option(False, help="Display the extracted tokens (only for single file)"),
+	compute_frequency: bool = typer.Option(True, help="Compute token frequency statistics (zipf scores)"),
 	show_metadata: bool = typer.Option(True, help="Show tokenization metadata"),
 ) -> None:
-	"""Extract tokens from subtitle file(s) for speech speed analysis."""
+	"""Extract tokens from subtitle file(s) for speech speed analysis and vocabulary frequency."""
 	from pathlib import Path as _Path
 	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
-	from .analysis.tokens import tokenize_subtitle, tokenize_subtitles
+	from .analysis.tokens import (
+		tokenize_subtitle, 
+		tokenize_subtitles,
+		compute_frequency_statistics,
+		compute_frequency_statistics_batch,
+		FrequencyConfig
+	)
 	from .util.types import Subtitle
 	from rich.table import Table as _Table
 	
@@ -665,6 +672,23 @@ def tokenize_cmd(
 		print(f"  Total tokens: {len(tokens)}")
 		print(f"  Unique tokens: {len(set(tokens))}")
 		
+		# Compute frequency statistics
+		if compute_frequency:
+			print(f"\n[blue]Computing frequency statistics...[/blue]")
+			freq_config = FrequencyConfig()
+			freq_stats, zipf_scores = compute_frequency_statistics(tokens, detected_lang, freq_config, metadata)
+			
+			print(f"\n[yellow]Frequency Statistics (Zipf Scores):[/yellow]")
+			print(f"  Quantiles:")
+			for key, value in freq_stats["quantiles"].items():
+				print(f"    {key}: {value}")
+			
+			print(f"\n  Bucket Distribution:")
+			for bucket, percentage in freq_stats["bucket_percentages"].items():
+				print(f"    {bucket}: {percentage:.4f}")
+			
+			print(f"\n  Mean zipf score: {freq_stats['mean']}")
+		
 		if show_tokens:
 			print(f"\n[yellow]Tokens:[/yellow]")
 			# Display tokens in a readable format (wrap at 80 chars)
@@ -684,6 +708,11 @@ def tokenize_cmd(
 		if show_metadata:
 			print(f"\n[yellow]Metadata:[/yellow]")
 			print(json.dumps(metadata, indent=2, default=str))
+		
+		# Print frequency results separately if computed
+		if compute_frequency:
+			print(f"\n[yellow]Frequency Analysis Results:[/yellow]")
+			print(json.dumps({"stats": freq_stats}, indent=2, default=str))
 	
 	# Batch mode
 	else:
@@ -755,9 +784,79 @@ def tokenize_cmd(
 		print(f"  Total tokens: {total_tokens}")
 		print(f"  Total unique tokens: {total_unique}")
 		
+		# Compute frequency statistics for batch
+		if compute_frequency:
+			print(f"\n[blue]Computing frequency statistics for all files...[/blue]")
+			freq_config = FrequencyConfig()
+			aggregate_stats, per_file_stats = compute_frequency_statistics_batch(
+				all_tokens, majority_lang, freq_config, metadata
+			)
+			
+			print(f"\n[yellow]Aggregate Frequency Statistics (All Files Combined):[/yellow]")
+			print(f"  Total tokens: {aggregate_stats['total_tokens']}")
+			print(f"  Unique tokens: {aggregate_stats['unique_tokens']}")
+			print(f"\n  Quantiles:")
+			for key, value in aggregate_stats["quantiles"].items():
+				print(f"    {key}: {value}")
+			
+			print(f"\n  Bucket Distribution:")
+			for bucket, percentage in aggregate_stats["bucket_percentages"].items():
+				print(f"    {bucket}: {percentage:.4f}")
+			
+			print(f"\n  Mean zipf score: {aggregate_stats['mean']}")
+			
+			# Create per-file frequency stats table
+			# Get bucket keys dynamically (first and last buckets for display)
+			bucket_keys = list(aggregate_stats["bucket_percentages"].keys())
+			first_bucket = bucket_keys[0] if bucket_keys else "N/A"
+			last_bucket = bucket_keys[-1] if bucket_keys else "N/A"
+			
+			freq_table = _Table(title="Per-File Frequency Statistics")
+			freq_table.add_column("File")
+			freq_table.add_column("Median", justify="right")
+			freq_table.add_column("P25", justify="right")
+			freq_table.add_column("P75", justify="right")
+			freq_table.add_column("Mean", justify="right")
+			freq_table.add_column(f"{last_bucket} %", justify="right")
+			freq_table.add_column(f"{first_bucket} %", justify="right")
+			
+			for i, p in enumerate(paths):
+				file_key = f"file_{i}"
+				if file_key in per_file_stats:
+					fstats = per_file_stats[file_key]
+					
+					# Get median and quantiles, with fallback
+					median = fstats["quantiles"].get("0.5", "N/A")
+					p25 = fstats["quantiles"].get("0.25", "N/A")
+					p75 = fstats["quantiles"].get("0.75", "N/A")
+					
+					# Get bucket percentages
+					last_bucket_pct = f"{fstats['bucket_percentages'].get(last_bucket, 0):.4f}"
+					first_bucket_pct = f"{fstats['bucket_percentages'].get(first_bucket, 0):.4f}"
+					
+					freq_table.add_row(
+						p.name,
+						str(median),
+						str(p25),
+						str(p75),
+						str(fstats["mean"]),
+						f"{last_bucket_pct}%",
+						f"{first_bucket_pct}%"
+					)
+			
+			print(f"\n{freq_table}")
+		
 		if show_metadata:
 			print(f"\n[yellow]Metadata:[/yellow]")
 			print(json.dumps(metadata, indent=2, default=str))
+		
+		# Print frequency results separately if computed
+		if compute_frequency:
+			print(f"\n[yellow]Frequency Analysis Results:[/yellow]")
+			print(json.dumps({
+				"aggregate_stats": aggregate_stats,
+				"per_file_stats": per_file_stats
+			}, indent=2, default=str))
 
 
 @app.command(name="consensus")
