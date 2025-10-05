@@ -48,3 +48,6 @@ This section summarizes the alignment subsystem that enables the metrics above.
 ---
 
 
+## TODOs:
+
+There seem to be many subtitles in a different format than the typical srt. We need to be able to distinguish this at load time and use a different parser.

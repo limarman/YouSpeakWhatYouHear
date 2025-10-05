@@ -16,3 +16,18 @@ As subtitles usually describe actual speech and not written content, the text wi
 
 One idea to normalize this is a fuzzy text search that in case you have a (very) rare token you attempt to find a very similar token from a list of common words. If you find one you take that, if not you fallback to the original token.
 The danger of this approach is that it is not clear how to set the threshold fuzzy search. Also rare words might be falsely mapped to common words just because they look similar. A package that can help with this search is "rapidfuzz".
+
+
+## Tokenization Cleaning
+The computation of tokens should be cleaned with the consensus file. Only areas that have an overlap with the (time) consensus file should count for the tokens. The rest has been "sorted out".
+
+## Other "Hardness" Metrics:
+It seems like the token "rarity" metric is not helpful at all. Good Doctor, Sherlock, Peppa Pig, Last Airbender all seem to have very similar zipf distributions in the end.
+
+The speech speed does seem to make a small difference. Beginner content (Peppa The Pig) has a lower speech speed (1.9t/s) then Sherlock (2.9t/s). And Avatar Aang is somewhere in the middle (2.5t/s, 2.7t/s).
+
+Another hardness metric might be the redundancy of words. Maybe especially the redundancy of rare tokens. A word that is repeated often helps to understand and to learn it.
+
+## Subtitle Sparseness
+
+The current algorithm only works with (almost) CC subtitles from the original series. In maaaany cases you will not have them. One idea to deal with these cases is to find another language (most likely English is easier to find) and match that. This should not work very well because the matching will be quite bad in general (parapharasing etc.), however we can try to work around that by using embedding similarity with a tiny (and fast!) embedding model. Instead of the character n-hash similiarity we use e.g. the (inverse) cosine distance of the embeddings. This should hopefully be not tooo much extra computation time as the embeddings have to be computed only ONCE and can be done in hyper-parallel for every cue.
