@@ -166,7 +166,7 @@ def fetch_opensubtitles_cmd(
 	platform: str = typer.Option("web", help="Platform name to organize storage"),
 	platform_id: str | None = typer.Option(None, help="Platform-specific ID; optional"),
 	title: str | None = typer.Option(None, help="Title to organize storage"),
-	delay: float = typer.Option(0.5, "--delay", help="Delay between downloads in seconds (0 to disable)"),
+	delay: float = typer.Option(0.7, "--delay", help="Delay between downloads in seconds (0 to disable)"),
 ) -> None:
 	"""Download subtitles directly from OpenSubtitles.org by IMDB ID."""
 	paths = fetch_subtitles_from_opensubtitles(
@@ -890,7 +890,6 @@ def consensus_cmd(
 	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
 	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
 	target_agreement_pct: float = typer.Option(0.66, help="Target agreement percentage (0.0-1.0)"),
-	max_agreement_pct: float = typer.Option(0.75, help="Maximum agreement percentage cap (0.0-1.0)"),
 	merge_micro_gaps: bool = typer.Option(True, help="Merge small gaps between intervals"),
 	micro_gap_seconds: float = typer.Option(0.2, help="Maximum gap size to merge (seconds)"),
 	min_interval_seconds: float = typer.Option(0.3, help="Minimum interval duration to keep (seconds)"),
@@ -962,7 +961,6 @@ def consensus_cmd(
 	# Configure consensus
 	config = ConsensusConfig(
 		target_agreement_pct=target_agreement_pct,
-		max_agreement_pct=max_agreement_pct,
 		merge_micro_gaps=merge_micro_gaps,
 		micro_gap_seconds=micro_gap_seconds,
 		min_interval_seconds=min_interval_seconds

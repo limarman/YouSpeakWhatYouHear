@@ -205,7 +205,7 @@ def fetch_subtitles_from_opensubtitles(
     platform: str = "web",
     platform_id: Optional[str] = None,
     title: Optional[str] = None,
-    delay_seconds: float = 0.5,
+    delay_seconds: float = 0.7,
 ) -> List[Path]:
     """Fetch multiple subtitles from OpenSubtitles.org by IMDB ID.
     
@@ -219,7 +219,7 @@ def fetch_subtitles_from_opensubtitles(
         platform: Platform identifier for storage (default: 'web')
         platform_id: Optional platform-specific ID
         title: Optional title for storage organization
-        delay_seconds: Delay between downloads in seconds (default: 0.5, set to 0 to disable)
+        delay_seconds: Delay between downloads in seconds (default: 0.7, set to 0 to disable)
     
     Returns:
         List of Path objects pointing to saved subtitle files

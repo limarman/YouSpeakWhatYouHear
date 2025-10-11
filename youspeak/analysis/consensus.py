@@ -18,23 +18,20 @@ from youspeak.util.types import Subtitle
 class ConsensusConfig:
     """Configuration for consensus computation."""
     target_agreement_pct: float = 0.66  # Target 66% agreement (2/3 majority)
-    max_agreement_pct: float = 0.75     # Cap at 75% to avoid being too strict
     merge_micro_gaps: bool = True
     micro_gap_seconds: float = 0.2
     min_interval_seconds: float = 0.3
 
 
-def _compute_threshold_k(n: int, target_pct: float, max_pct: float) -> int:
+def _compute_threshold_k(n: int, target_pct: float) -> int:
     """Compute optimal k threshold for n subtitles.
     
     Strategy:
     - Target target_pct agreement (e.g., 66% for 2/3 majority)
-    - Cap at max_pct to avoid being too strict with many subtitles
     
     Args:
         n: Number of subtitles
         target_pct: Target agreement percentage (0.0 to 1.0)
-        max_pct: Maximum agreement percentage cap (0.0 to 1.0)
         
     Returns:
         Number of subtitles that must agree (k)
@@ -44,10 +41,6 @@ def _compute_threshold_k(n: int, target_pct: float, max_pct: float) -> int:
     
     # Target desired percentage
     k = math.ceil(n * target_pct)
-    
-    # Cap at maximum percentage
-    if k / n > max_pct:
-        k = math.floor(n * max_pct)
     
     # Ensure at least 1
     return max(1, k)
@@ -115,7 +108,7 @@ def compute_consensus(
         raise ValueError("No subtitles provided")
     
     # Compute optimal k threshold
-    k = _compute_threshold_k(n, config.target_agreement_pct, config.max_agreement_pct)
+    k = _compute_threshold_k(n, config.target_agreement_pct)
     
     # Extract intervals from each subtitle
     per_subtitle_intervals: List[List[Tuple[float, float]]] = []
