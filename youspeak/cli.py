@@ -8,6 +8,7 @@ Primary Commands:
   - preview-html: Generate HTML preview of subtitles
   - init-db, list, ingest-subtitle: Database operations
   - fetch-subliminal-candidates: Fetch subtitle candidates from subliminal search
+  - fetch-opensubtitles: Download subtitles directly from OpenSubtitles.org by IMDB ID
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from .data.db import init_db, list_content
 from .parsers.subtitles import ingest_subtitle_from_source
 from .viewer.static_viewer import generate_static_preview
 from .fetchers.subliminal_fetcher import fetch_candidates_with_subliminal_search
+from .fetchers.opensubtitles_fetcher import fetch_subtitles_from_opensubtitles
 
 
 # Enable INFO-level logging globally so Subliminal's logger.info messages are printed
@@ -152,6 +154,27 @@ def fetch_subliminal_candidates_cmd(
 		platform_id=platform_id,
 		title=title,
 		imdb_id=imdb_id,
+	)
+	print({"saved": [str(p) for p in paths]})
+
+
+@app.command(name="fetch-opensubtitles")
+def fetch_opensubtitles_cmd(
+	imdb_id: str = typer.Argument(..., help="IMDB ID (e.g., 'tt0903747' or '903747')"),
+	language: str = typer.Option("eng", "--lang", help="Subtitle language code (e.g., en, es)"),
+	max_count: int = typer.Option(10, "--max-count", help="Maximum number of subtitles to download"),
+	platform: str = typer.Option("web", help="Platform name to organize storage"),
+	platform_id: str | None = typer.Option(None, help="Platform-specific ID; optional"),
+	title: str | None = typer.Option(None, help="Title to organize storage"),
+) -> None:
+	"""Download subtitles directly from OpenSubtitles.org by IMDB ID."""
+	paths = fetch_subtitles_from_opensubtitles(
+		imdb_id=imdb_id,
+		language=language,
+		max_count=max_count,
+		platform=platform,
+		platform_id=platform_id,
+		title=title,
 	)
 	print({"saved": [str(p) for p in paths]})
 
