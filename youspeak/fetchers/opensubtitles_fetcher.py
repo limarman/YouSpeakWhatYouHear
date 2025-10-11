@@ -60,25 +60,32 @@ def _build_search_url(imdb_id: str, language: str = "en") -> str:
     return f"https://www.opensubtitles.org/en/search/sublanguageid-{language}/imdbid-{normalized_id}/sort-7/asc-0"
 
 
-def _scrape_subtitle_ids(search_url: str, max_count: int) -> List[Tuple[str, str]]:
-    """Scrape subtitle IDs from OpenSubtitles search results page.
-    
-    Args:
-        search_url: The OpenSubtitles search URL
-        max_count: Maximum number of subtitle IDs to extract
+def _create_scraper():
+    """Create a reusable cloudscraper instance with browser settings.
     
     Returns:
-        List of tuples (subtitle_id, movie_name) extracted from the page
+        Configured cloudscraper instance
     """
-    # Use cloudscraper to bypass Cloudflare protection
-    scraper = cloudscraper.create_scraper(
+    return cloudscraper.create_scraper(
         browser={
             'browser': 'chrome',
             'platform': 'windows',
             'mobile': False
         }
     )
+
+
+def _scrape_subtitle_ids(search_url: str, max_count: int, scraper) -> List[Tuple[str, str]]:
+    """Scrape subtitle IDs from OpenSubtitles search results page.
     
+    Args:
+        search_url: The OpenSubtitles search URL
+        max_count: Maximum number of subtitle IDs to extract
+        scraper: Cloudscraper instance (maintains session)
+    
+    Returns:
+        List of tuples (subtitle_id, movie_name) extracted from the page
+    """
     try:
         response = scraper.get(search_url, timeout=30)
         response.raise_for_status()
@@ -166,11 +173,12 @@ def _extract_subtitle_from_archive(content: bytes, sub_id: str) -> Tuple[bytes, 
             return subtitle_content_utf8, extension
 
 
-def _download_subtitle(sub_id: str) -> bytes:
+def _download_subtitle(sub_id: str, scraper) -> bytes:
     """Download a subtitle file given its ID.
     
     Args:
         sub_id: The OpenSubtitles subtitle ID
+        scraper: Cloudscraper instance (maintains session)
     
     Returns:
         Raw subtitle file content (typically compressed)
@@ -181,15 +189,6 @@ def _download_subtitle(sub_id: str) -> bytes:
     # Note: The vrf token might change over time. If downloads fail in the future,
     # this might need to be updated or extracted from the page dynamically.
     download_url = f"https://www.opensubtitles.org/en/download/vrf-108d030f/sub/{sub_id}"
-    
-    # Use cloudscraper to bypass Cloudflare protection
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False
-        }
-    )
     
     try:
         response = scraper.get(download_url, timeout=30, allow_redirects=True)
@@ -206,6 +205,7 @@ def fetch_subtitles_from_opensubtitles(
     platform: str = "web",
     platform_id: Optional[str] = None,
     title: Optional[str] = None,
+    delay_seconds: float = 0.5,
 ) -> List[Path]:
     """Fetch multiple subtitles from OpenSubtitles.org by IMDB ID.
     
@@ -214,11 +214,12 @@ def fetch_subtitles_from_opensubtitles(
     
     Args:
         imdb_id: IMDB ID (with or without 'tt' prefix, e.g., 'tt0123456' or '123456')
-        language: ISO language code (default: 'en')
+        language: ISO language code (default: 'eng')
         max_count: Maximum number of subtitles to download (default: 10)
         platform: Platform identifier for storage (default: 'web')
         platform_id: Optional platform-specific ID
         title: Optional title for storage organization
+        delay_seconds: Delay between downloads in seconds (default: 0.5, set to 0 to disable)
     
     Returns:
         List of Path objects pointing to saved subtitle files
@@ -228,15 +229,18 @@ def fetch_subtitles_from_opensubtitles(
         FileNotFoundError: If no subtitles are found
     
     Example:
-        >>> paths = fetch_subtitles_from_opensubtitles('tt0903747', language='en', max_count=5)
+        >>> paths = fetch_subtitles_from_opensubtitles('tt0903747', language='eng', max_count=5)
         >>> print(f"Downloaded {len(paths)} subtitle files")
     """
+    # Create a single scraper instance to reuse session/cookies
+    scraper = _create_scraper()
+    
     # Build search URL
     search_url = _build_search_url(imdb_id, language)
     print(f"Searching OpenSubtitles: {search_url}")
     
     # Scrape subtitle IDs
-    subtitle_info = _scrape_subtitle_ids(search_url, max_count)
+    subtitle_info = _scrape_subtitle_ids(search_url, max_count, scraper)
     
     if not subtitle_info:
         raise FileNotFoundError(
@@ -265,8 +269,8 @@ def fetch_subtitles_from_opensubtitles(
         try:
             print(f"Downloading subtitle {idx}/{len(subtitle_info)} (ID: {sub_id})...")
             
-            # Download the subtitle archive
-            archive_content = _download_subtitle(sub_id)
+            # Download the subtitle archive (reusing scraper session)
+            archive_content = _download_subtitle(sub_id, scraper)
             
             # Extract subtitle from archive (ZIP/GZIP)
             try:
@@ -285,9 +289,9 @@ def fetch_subtitles_from_opensubtitles(
             
             print(f"  Saved to: {out_path}")
             
-            # Be polite to the server - add a small delay between downloads
-            if idx < len(subtitle_info):
-                time.sleep(1)
+            # Be polite to the server - add a delay between downloads
+            if idx < len(subtitle_info) and delay_seconds > 0:
+                time.sleep(delay_seconds)
                 
         except Exception as e:
             print(f"  Warning: Failed to download subtitle {sub_id}: {e}")

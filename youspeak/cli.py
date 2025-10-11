@@ -166,6 +166,7 @@ def fetch_opensubtitles_cmd(
 	platform: str = typer.Option("web", help="Platform name to organize storage"),
 	platform_id: str | None = typer.Option(None, help="Platform-specific ID; optional"),
 	title: str | None = typer.Option(None, help="Title to organize storage"),
+	delay: float = typer.Option(0.5, "--delay", help="Delay between downloads in seconds (0 to disable)"),
 ) -> None:
 	"""Download subtitles directly from OpenSubtitles.org by IMDB ID."""
 	paths = fetch_subtitles_from_opensubtitles(
@@ -175,6 +176,7 @@ def fetch_opensubtitles_cmd(
 		platform=platform,
 		platform_id=platform_id,
 		title=title,
+		delay_seconds=delay,
 	)
 	print({"saved": [str(p) for p in paths]})
 
