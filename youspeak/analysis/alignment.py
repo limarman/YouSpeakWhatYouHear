@@ -457,6 +457,9 @@ def align_subtitle_matrix(
     alignments = []
     n = len(subtitles)
     
+    nw_time = 0.0
+    growmerge_time = 0.0
+    
     for i in range(n):
         for j in range(i + 1, n):
             # Use precomputed vectors if available
@@ -466,16 +469,20 @@ def align_subtitle_matrix(
             norms_b = all_norms[j] if all_norms else None
             
             # Run alignment
+            nw_start = time.time()
             alignment, similarity_matrix = _needleman_wunsch_align(
                 subtitles[i].texts, subtitles[j].texts, config,
                 vectors_a, norms_a, vectors_b, norms_b
             )
+            nw_time += time.time() - nw_start
             
             # Compute blocks
+            gm_start = time.time()
             blocks = _compute_blocks_growmerge(
                 alignment, similarity_matrix, 
                 subtitles[i].texts, subtitles[j].texts, config
             )
+            growmerge_time += time.time() - gm_start
             
             # Convert to BlockAlignment
             blocks_file_a = []
@@ -505,7 +512,9 @@ def align_subtitle_matrix(
         "config": config.__dict__.copy(),
         "total_pairs": len(alignments),
         "computation_time": round(total_time, 3),
-        "precomputation_time": round(precompute_time, 3)
+        "precomputation_time": round(precompute_time, 3),
+        "nw_time": round(nw_time, 3),
+        "growmerge_time": round(growmerge_time, 3)
     })
     
     return alignments, metadata
