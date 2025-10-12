@@ -190,6 +190,8 @@ def align_pair_cmd(
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
 	grow_threshold: float = typer.Option(0.05, help="Min improvement for grow-merge"),
 	use_hashing: bool = typer.Option(True, help="Use hashed n-gram vectors (faster)"),
+	use_banded: bool = typer.Option(True, help="Use banded NW alignment for speedup"),
+	band_margin_pct: float = typer.Option(0.10, help="Band margin as percentage of avg length (0..1)"),
 	show_nw: bool = typer.Option(True, help="Show Needleman-Wunsch alignment details"),
 	show_nw_limit: int = typer.Option(50, help="Max NW alignment rows to show"),
 	show_blocks: bool = typer.Option(True, help="Show block alignment results"),
@@ -241,7 +243,9 @@ def align_pair_cmd(
 		gap_penalty=gap_penalty,
 		min_similarity=min_sim,
 		grow_merge_threshold=grow_threshold,
-		use_hashing=use_hashing
+		use_hashing=use_hashing,
+		use_banded=use_banded,
+		band_margin_pct=band_margin_pct
 	)
 	
 	print("[blue]Running NW alignment + block merging...[/blue]")
@@ -251,7 +255,7 @@ def align_pair_cmd(
 	start_time = time.time()
 	
 	# Run NW alignment to get raw alignment + similarity matrix
-	nw_alignment, similarity_matrix = _needleman_wunsch_align(
+	nw_alignment, similarity_matrix, align_meta = _needleman_wunsch_align(
 		sub_a.texts, sub_b.texts, config
 	)
 	
@@ -302,11 +306,17 @@ def align_pair_cmd(
 				"gap_penalty": config.gap_penalty,
 				"min_similarity": config.min_similarity,
 				"grow_merge_threshold": config.grow_merge_threshold,
-				"use_hashing": config.use_hashing
+				"use_hashing": config.use_hashing,
+				"use_banded": config.use_banded,
+				"band_margin_pct": config.band_margin_pct
 			},
 			"computation_time": round(elapsed_time, 3)
 		}
 	}
+	
+	# Add band_width if banded alignment was used
+	if align_meta.get("band_width") is not None:
+		metadata["pairwise_alignment"]["band_width"] = align_meta["band_width"]
 	
 	# Show NW alignment results
 	if show_nw:
@@ -378,6 +388,8 @@ def align_pipeline_cmd(
 	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
 	grow_threshold: float = typer.Option(0.05, help="Min improvement for grow-merge"),
+	use_banded: bool = typer.Option(True, help="Use banded NW alignment for speedup"),
+	band_margin_pct: float = typer.Option(0.10, help="Band margin as percentage of avg length (0..1)"),
 	component_threshold: float | None = typer.Option(None, help="Edge threshold for candidate selection"),
 	hard_anchor_threshold: float = typer.Option(0.9, help="Similarity threshold for hard anchors"),
 	clean_threshold: float = typer.Option(0.5, help="Support threshold for cleaning"),
@@ -468,7 +480,9 @@ def align_pipeline_cmd(
 		gap_penalty=gap_penalty,
 		min_similarity=min_sim,
 		grow_merge_threshold=grow_threshold,
-		use_hashing=True
+		use_hashing=True,
+		use_banded=use_banded,
+		band_margin_pct=band_margin_pct
 	)
 	alignments, metadata = align_subtitle_matrix(subtitles, config, metadata)
 	print(f"[green]Computed {len(alignments)} pairwise alignments[/green]")

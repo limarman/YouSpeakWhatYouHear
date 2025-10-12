@@ -32,6 +32,8 @@ class BlockAlignmentConfig:
     grow_merge_threshold: float = 0.05
     use_hashing: bool = True
     hash_dim: int = 32768
+    use_banded: bool = True
+    band_margin_pct: float = 0.10
 
 
 # =============================================================================
@@ -164,6 +166,28 @@ def _build_hashed_ngram_vectors_batch(
     return all_vectors, all_norms
 
 
+def _calculate_band_width(m: int, n: int, config: BlockAlignmentConfig) -> int:
+    """Calculate adaptive band width for banded Needleman-Wunsch.
+    
+    Band width = |m - n| + margin
+    
+    The |m - n| term ensures the path can reach from (0,0) to (m,n).
+    The margin allows for local variations (gaps, different line splits).
+    
+    Args:
+        m: Length of first sequence
+        n: Length of second sequence
+        config: Configuration with band_margin_pct
+        
+    Returns:
+        Band width (distance from diagonal to compute)
+    """
+    length_diff = abs(m - n)
+    avg_length = (m + n) / 2.0
+    margin = int(config.band_margin_pct * avg_length)
+    return length_diff + margin
+
+
 def _needleman_wunsch_align(
     texts_a: List[str],
     texts_b: List[str],
@@ -172,10 +196,15 @@ def _needleman_wunsch_align(
     norms_a: Optional[np.ndarray] = None,
     vectors_b: Optional[np.ndarray] = None, 
     norms_b: Optional[np.ndarray] = None,
-) -> Tuple[List[Tuple[int | None, int | None]], np.ndarray]:
-    """Needleman-Wunsch global alignment with optional precomputed vectors."""
+) -> Tuple[List[Tuple[int | None, int | None]], np.ndarray, Dict[str, Any]]:
+    """Needleman-Wunsch global alignment with optional banding and precomputed vectors."""
     m = len(texts_a)
     n = len(texts_b)
+    
+    # Calculate band width if using banded alignment
+    band_width = None
+    if config.use_banded:
+        band_width = _calculate_band_width(m, n, config)
     
     # Build similarity matrix
     if config.use_hashing and vectors_a is not None and vectors_b is not None:
@@ -212,19 +241,35 @@ def _needleman_wunsch_align(
     
     dp[0, 0] = 0.0
     
-    # Initialize boundaries
-    for i in range(1, m + 1):
-        dp[i, 0] = dp[i - 1, 0] + config.gap_penalty
-        bt_i[i, 0] = i - 1
-        bt_j[i, 0] = 0
-    for j in range(1, n + 1):
-        dp[0, j] = dp[0, j - 1] + config.gap_penalty
-        bt_i[0, j] = 0
-        bt_j[0, j] = j - 1
+    # Helper to check if cell is in band
+    def in_band(i: int, j: int) -> bool:
+        if not config.use_banded:
+            return True
+        return abs(i - j) <= band_width
     
-    # Fill DP table
+    # Initialize boundaries (within band)
     for i in range(1, m + 1):
-        for j in range(1, n + 1):
+        if in_band(i, 0):
+            dp[i, 0] = dp[i - 1, 0] + config.gap_penalty
+            bt_i[i, 0] = i - 1
+            bt_j[i, 0] = 0
+    for j in range(1, n + 1):
+        if in_band(0, j):
+            dp[0, j] = dp[0, j - 1] + config.gap_penalty
+            bt_i[0, j] = 0
+            bt_j[0, j] = j - 1
+    
+    # Fill DP table (only cells within band)
+    for i in range(1, m + 1):
+        # Compute band bounds for this row
+        if config.use_banded:
+            j_start = max(1, i - band_width)
+            j_end = min(n + 1, i + band_width + 1)
+        else:
+            j_start = 1
+            j_end = n + 1
+        
+        for j in range(j_start, j_end):
             sim = float(S[i - 1, j - 1])
             match = dp[i - 1, j - 1] + sim if sim >= config.min_similarity else -1e12
             delete = dp[i - 1, j] + config.gap_penalty
@@ -257,7 +302,13 @@ def _needleman_wunsch_align(
         i, j = pi, pj
     
     alignment.reverse()
-    return alignment, S
+    
+    # Build minimal metadata
+    metadata = {}
+    if band_width is not None:
+        metadata["band_width"] = band_width
+    
+    return alignment, S, metadata
 
 
 def _compute_blocks_growmerge(
@@ -401,7 +452,7 @@ def align_subtitle_pair(
 ) -> BlockAlignment:
     """Align two subtitles using NW + grow-merge to produce block alignment."""
     # Run NW alignment
-    alignment, similarity_matrix = _needleman_wunsch_align(
+    alignment, similarity_matrix, _ = _needleman_wunsch_align(
         subtitle_a.texts, subtitle_b.texts, config
     )
     
@@ -470,7 +521,7 @@ def align_subtitle_matrix(
             
             # Run alignment
             nw_start = time.time()
-            alignment, similarity_matrix = _needleman_wunsch_align(
+            alignment, similarity_matrix, _ = _needleman_wunsch_align(
                 subtitles[i].texts, subtitles[j].texts, config,
                 vectors_a, norms_a, vectors_b, norms_b
             )
