@@ -26,7 +26,8 @@ This section summarizes the alignment subsystem that enables the metrics above.
 
 ### Matching: Needleman–Wunsch + Local Grow‑Merge
 - Global alignment (NW) with parameters such as gap_penalty (default −0.4) and a hard floor on cue‑cue similarity (default min_sim=0.3).
-- Local grow‑merge: starting from a seed match, iteratively extend over consecutive gaps on either side if stripped 3‑gram cosine strictly improves (tunable threshold). This produces many↔many merged “blocks”.
+- **Adaptive Banded NW** (enabled by default): Restricts DP computation to diagonal band of width `|m−n| + margin`, where margin = 10% of average sequence length. This ensures the optimal path can reach (m,n) while providing 2x+ speedup for typical subtitle pairs. Band width adapts automatically to sequence length differences.
+- Local grow‑merge: starting from a seed match, iteratively extend over consecutive gaps on either side if stripped 3‑gram cosine strictly improves (tunable threshold). This produces many↔many merged "blocks".
 - Each merged block carries: A‑range [i0..i1], B‑range [j0..j1], and a similarity score.
 
 ### Selecting Relevant Subtitles (Largest Connected Component)
