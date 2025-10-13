@@ -185,11 +185,19 @@ def fetch_opensubtitles_cmd(
 def align_pair_cmd(
 	file_a: str = typer.Argument(..., help="First subtitle file (.srt/.vtt)"),
 	file_b: str = typer.Argument(..., help="Second subtitle file (.srt/.vtt)"),
-	n: int = typer.Option(3, help="Character n-gram size for similarity"),
+	# Alignment mode selection
+	use_embeddings: bool = typer.Option(False, "--use-embeddings", help="Use embedding-based similarity instead of n-grams (for cross-language alignment)"),
+	# N-gram parameters (ignored if use_embeddings=True)
+	n: int = typer.Option(3, help="Character n-gram size for similarity (n-gram mode only)"),
+	use_hashing: bool = typer.Option(True, help="Use hashed n-gram vectors (faster, n-gram mode only)"),
+	# Embedding parameters (ignored if use_embeddings=False)
+	model_name: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--model", help="Sentence transformer model name (embedding mode only)"),
+	use_gpu: bool = typer.Option(True, "--use-gpu", help="Use GPU for embedding computation if available (embedding mode only)"),
+	batch_size: int = typer.Option(32, "--batch-size", help="Batch size for embedding computation (embedding mode only)"),
+	# Common alignment parameters
 	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
 	grow_threshold: float = typer.Option(0.05, help="Min improvement for grow-merge"),
-	use_hashing: bool = typer.Option(True, help="Use hashed n-gram vectors (faster)"),
 	use_banded: bool = typer.Option(True, help="Use banded NW alignment for speedup"),
 	band_margin_pct: float = typer.Option(0.10, help="Band margin as percentage of avg length (0..1)"),
 	show_nw: bool = typer.Option(True, help="Show Needleman-Wunsch alignment details"),
@@ -200,7 +208,8 @@ def align_pair_cmd(
 	from pathlib import Path as _Path
 	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
 	from .analysis.normalization import normalize_subtitle, NormalizationConfig
-	from .analysis.alignment import _needleman_wunsch_align, _compute_blocks_growmerge, BlockAlignmentConfig
+	from .analysis.alignment import align_subtitle_pair, NGramAlignmentConfig
+	from .analysis.embedding import EmbeddingAlignmentConfig
 	from .util.types import Subtitle, BlockAlignment
 	
 	# Load and normalize subtitles
@@ -226,8 +235,17 @@ def align_pair_cmd(
 			original_texts=original_texts
 		)
 		
-		# Normalize
-		norm_config = NormalizationConfig()
+		# Normalize with appropriate config based on alignment mode
+		if use_embeddings:
+			# Use gentle normalization for embeddings (preserve punctuation and spacing)
+			norm_config = NormalizationConfig(
+				drop_punctuation=False,
+				collapse_whitespace=False
+			)
+		else:
+			# Use aggressive normalization for n-grams (current behavior)
+			norm_config = NormalizationConfig()
+		
 		normalized_subtitle, _ = normalize_subtitle(subtitle, norm_config)
 		return normalized_subtitle
 	
@@ -237,39 +255,78 @@ def align_pair_cmd(
 	
 	print(f"[green]Loaded:[/green] {len(sub_a.texts)} cues from A, {len(sub_b.texts)} cues from B")
 	
-	# Configure alignment
-	config = BlockAlignmentConfig(
-		n_gram_size=n,
-		gap_penalty=gap_penalty,
-		min_similarity=min_sim,
-		grow_merge_threshold=grow_threshold,
-		use_hashing=use_hashing,
-		use_banded=use_banded,
-		band_margin_pct=band_margin_pct
-	)
+	# Configure alignment based on mode
+	if use_embeddings:
+		print(f"[blue]Using embedding-based alignment with model: {model_name}[/blue]")
+		config = EmbeddingAlignmentConfig(
+			model_name=model_name,
+			batch_size=batch_size,
+			use_gpu=use_gpu,
+			gap_penalty=gap_penalty,
+			min_similarity=min_sim,
+			grow_merge_threshold=grow_threshold,
+			use_banded=use_banded,
+			band_margin_pct=band_margin_pct
+		)
+	else:
+		print(f"[blue]Using n-gram alignment (n={n}, hashing={use_hashing})[/blue]")
+		config = NGramAlignmentConfig(
+			n_gram_size=n,
+			use_hashing=use_hashing,
+			gap_penalty=gap_penalty,
+			min_similarity=min_sim,
+			grow_merge_threshold=grow_threshold,
+			use_banded=use_banded,
+			band_margin_pct=band_margin_pct
+		)
 	
-	print("[blue]Running NW alignment + block merging...[/blue]")
+	print("[blue]Running alignment...[/blue]")
 	
 	# Track time for metadata
 	import time
 	start_time = time.time()
 	
-	# Run NW alignment to get raw alignment + similarity matrix
-	nw_alignment, similarity_matrix, align_meta = _needleman_wunsch_align(
-		sub_a.texts, sub_b.texts, config
+	# Use low-level functions to get detailed NW alignment results
+	from .analysis.alignment import (
+		_needleman_wunsch_align, 
+		_compute_blocks_growmerge,
+		_build_hashed_ngram_vectors_batch
+	)
+	from .analysis.embedding import build_embedding_vectors_batch
+	
+	# Precompute vectors if using embedding or n-gram with hashing
+	vectors_a = vectors_b = norms_a = norms_b = None
+	if isinstance(config, EmbeddingAlignmentConfig):
+		all_vectors, all_norms = build_embedding_vectors_batch(
+			[sub_a.texts, sub_b.texts], config
+		)
+		vectors_a, vectors_b = all_vectors[0], all_vectors[1]
+		norms_a, norms_b = all_norms[0], all_norms[1]
+	elif isinstance(config, NGramAlignmentConfig) and config.use_hashing:
+		all_vectors, all_norms = _build_hashed_ngram_vectors_batch(
+			[sub_a.texts, sub_b.texts],
+			n=config.n_gram_size,
+			hash_dim=config.hash_dim
+		)
+		vectors_a, vectors_b = all_vectors[0], all_vectors[1]
+		norms_a, norms_b = all_norms[0], all_norms[1]
+	
+	# Run NW alignment with precomputed vectors (or None for on-the-fly computation)
+	alignment, similarity_matrix, _ = _needleman_wunsch_align(
+		sub_a.texts, sub_b.texts, config,
+		vectors_a, norms_a, vectors_b, norms_b
 	)
 	
-	# Run grow-merge to get blocks
+	# Compute grow-merge blocks
 	blocks = _compute_blocks_growmerge(
-		nw_alignment, similarity_matrix, sub_a.texts, sub_b.texts, config
+		alignment, similarity_matrix, sub_a.texts, sub_b.texts, config
 	)
 	
-	elapsed_time = time.time() - start_time
-	
-	# Convert blocks to BlockAlignment format (for consistency)
+	# Convert to BlockAlignment format
 	blocks_file_a = []
 	blocks_file_b = []
 	similarity_scores = []
+	
 	for (a_range, b_range, score) in blocks:
 		blocks_file_a.append(a_range)
 		blocks_file_b.append(b_range)
@@ -284,41 +341,38 @@ def align_pair_cmd(
 		similarity=similarity_scores
 	)
 	
-	# Build metadata
-	num_matches = sum(1 for ai, bj in nw_alignment if ai is not None and bj is not None)
-	num_gaps_a = sum(1 for ai, bj in nw_alignment if ai is not None and bj is None)
-	num_gaps_b = sum(1 for ai, bj in nw_alignment if ai is None and bj is not None)
+	elapsed_time = time.time() - start_time
 	
+	# Build metadata
 	metadata = {
 		"pairwise_alignment": {
 			"file_a": block_alignment.file_a,
 			"file_b": block_alignment.file_b,
-			"nw_alignment": {
-				"total_pairs": len(nw_alignment),
-				"matches": num_matches,
-				"gaps_a": num_gaps_a,
-				"gaps_b": num_gaps_b
-			},
 			"num_blocks": block_alignment.num_blocks,
 			"avg_similarity": round(sum(block_alignment.similarity) / max(1, block_alignment.num_blocks), 3),
 			"config": {
-				"n_gram_size": config.n_gram_size,
+				"alignment_mode": "embedding" if use_embeddings else "n_gram",
 				"gap_penalty": config.gap_penalty,
 				"min_similarity": config.min_similarity,
 				"grow_merge_threshold": config.grow_merge_threshold,
-				"use_hashing": config.use_hashing,
 				"use_banded": config.use_banded,
-				"band_margin_pct": config.band_margin_pct
+				"band_margin_pct": config.band_margin_pct,
+				**(
+					{
+						"model_name": config.model_name,
+						"batch_size": config.batch_size,
+						"use_gpu": config.use_gpu
+					} if use_embeddings else {
+						"n_gram_size": config.n_gram_size,
+						"use_hashing": config.use_hashing
+					}
+				)
 			},
 			"computation_time": round(elapsed_time, 3)
 		}
 	}
 	
-	# Add band_width if banded alignment was used
-	if align_meta.get("band_width") is not None:
-		metadata["pairwise_alignment"]["band_width"] = align_meta["band_width"]
-	
-	# Show NW alignment results
+	# Show NW alignment details if requested
 	if show_nw:
 		from rich.table import Table as _Table
 		
@@ -327,7 +381,7 @@ def align_pair_cmd(
 			s = s.replace("\n", " ")
 			return (s[: width - 1] + "…") if len(s) > width else s
 		
-		nw_table = _Table(title=f"Needleman-Wunsch Alignment (showing {min(show_nw_limit, len(nw_alignment))} of {len(nw_alignment)} pairs)")
+		nw_table = _Table(title=f"Needleman-Wunsch Alignment (showing {min(show_nw_limit, len(alignment))} of {len(alignment)} pairs)")
 		nw_table.add_column("Pair")
 		nw_table.add_column("A idx")
 		nw_table.add_column("A text")
@@ -335,7 +389,7 @@ def align_pair_cmd(
 		nw_table.add_column("B idx")
 		nw_table.add_column("B text")
 		
-		for i, (ai, bj) in enumerate(nw_alignment[:show_nw_limit]):
+		for i, (ai, bj) in enumerate(alignment[:show_nw_limit]):
 			a_txt = sub_a.texts[ai] if ai is not None and 0 <= ai < len(sub_a.texts) else "—"
 			b_txt = sub_b.texts[bj] if bj is not None and 0 <= bj < len(sub_b.texts) else "—"
 			sim = f"{similarity_matrix[ai, bj]:.3f}" if (ai is not None and bj is not None) else "—"
@@ -349,9 +403,9 @@ def align_pair_cmd(
 				clip(b_txt)
 			)
 		
-		print(nw_table)
-		if len(nw_alignment) > show_nw_limit:
-			print(f"[dim]... {len(nw_alignment) - show_nw_limit} more pairs not shown (use --show-nw-limit to adjust)[/dim]")
+		from rich.console import Console
+		console = Console()
+		console.print(nw_table)
 	
 	# Show block results
 	if show_blocks:
@@ -384,7 +438,15 @@ def align_pipeline_cmd(
 	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) to align"),
 	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
 	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
-	n: int = typer.Option(3, help="Character n-gram size for similarity"),
+	# Alignment mode selection
+	use_embeddings: bool = typer.Option(False, "--use-embeddings", help="Use embedding-based similarity instead of n-grams (for cross-language alignment)"),
+	# N-gram parameters (ignored if use_embeddings=True)
+	n: int = typer.Option(3, help="Character n-gram size for similarity (n-gram mode only)"),
+	# Embedding parameters (ignored if use_embeddings=False)
+	model_name: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--model", help="Sentence transformer model name (embedding mode only)"),
+	use_gpu: bool = typer.Option(True, "--use-gpu", help="Use GPU for embedding computation if available (embedding mode only)"),
+	batch_size: int = typer.Option(32, "--batch-size", help="Batch size for embedding computation (embedding mode only)"),
+	# Common alignment parameters
 	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
 	grow_threshold: float = typer.Option(0.05, help="Min improvement for grow-merge"),
@@ -406,8 +468,9 @@ def align_pipeline_cmd(
 		align_to_master,
 		clean_subtitle,
 		compute_temporal_consistency_batch,
-		BlockAlignmentConfig
+		NGramAlignmentConfig
 	)
+	from .analysis.embedding import EmbeddingAlignmentConfig
 	from .util.types import Subtitle
 	
 	# Collect files
@@ -462,7 +525,17 @@ def align_pipeline_cmd(
 			original_texts=original_texts
 		)
 		
-		norm_config = NormalizationConfig()
+		# Normalize with appropriate config based on alignment mode
+		if use_embeddings:
+			# Use gentle normalization for embeddings (preserve punctuation and spacing)
+			norm_config = NormalizationConfig(
+				drop_punctuation=False,
+				collapse_whitespace=False
+			)
+		else:
+			# Use aggressive normalization for n-grams (current behavior)
+			norm_config = NormalizationConfig()
+		
 		normalized_subtitle, _ = normalize_subtitle(subtitle, norm_config)
 		return normalized_subtitle
 	
@@ -475,15 +548,29 @@ def align_pipeline_cmd(
 	
 	# Phase 1: Block alignment
 	print("[blue]Phase 1: Computing block alignments...[/blue]")
-	config = BlockAlignmentConfig(
-		n_gram_size=n,
-		gap_penalty=gap_penalty,
-		min_similarity=min_sim,
-		grow_merge_threshold=grow_threshold,
-		use_hashing=True,
-		use_banded=use_banded,
-		band_margin_pct=band_margin_pct
-	)
+	if use_embeddings:
+		print(f"[blue]Using embedding-based alignment with model: {model_name}[/blue]")
+		config = EmbeddingAlignmentConfig(
+			model_name=model_name,
+			batch_size=batch_size,
+			use_gpu=use_gpu,
+			gap_penalty=gap_penalty,
+			min_similarity=min_sim,
+			grow_merge_threshold=grow_threshold,
+			use_banded=use_banded,
+			band_margin_pct=band_margin_pct
+		)
+	else:
+		print(f"[blue]Using n-gram alignment (n={n})[/blue]")
+		config = NGramAlignmentConfig(
+			n_gram_size=n,
+			use_hashing=True,
+			gap_penalty=gap_penalty,
+			min_similarity=min_sim,
+			grow_merge_threshold=grow_threshold,
+			use_banded=use_banded,
+			band_margin_pct=band_margin_pct
+		)
 	alignments, metadata = align_subtitle_matrix(subtitles, config, metadata)
 	print(f"[green]Computed {len(alignments)} pairwise alignments[/green]")
 	

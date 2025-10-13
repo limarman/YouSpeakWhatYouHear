@@ -15,25 +15,33 @@ from __future__ import annotations
 import time
 import math
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple, Sequence
+from typing import List, Dict, Any, Optional, Tuple, Sequence, Union
 from collections import Counter
 
 import numpy as np
 
 from youspeak.util.types import Subtitle, BlockAlignment
+from youspeak.analysis.embedding import EmbeddingAlignmentConfig, build_embedding_vectors_batch
 
 
 @dataclass
-class BlockAlignmentConfig:
-    """Configuration for NW + grow-merge block matching."""
-    n_gram_size: int = 3
+class NGramAlignmentConfig:
+    """Configuration for n-gram based alignment."""
+    # Base alignment parameters
     gap_penalty: float = -0.4
     min_similarity: float = 0.3
     grow_merge_threshold: float = 0.05
-    use_hashing: bool = True
-    hash_dim: int = 32768
     use_banded: bool = True
     band_margin_pct: float = 0.10
+    
+    # N-gram specific parameters
+    n_gram_size: int = 3
+    use_hashing: bool = True
+    hash_dim: int = 32768
+
+
+# Legacy alias for backward compatibility
+BlockAlignmentConfig = NGramAlignmentConfig
 
 
 # =============================================================================
@@ -191,7 +199,7 @@ def _calculate_band_width(m: int, n: int, config: BlockAlignmentConfig) -> int:
 def _needleman_wunsch_align(
     texts_a: List[str],
     texts_b: List[str],
-    config: BlockAlignmentConfig,
+    config: Union[NGramAlignmentConfig, EmbeddingAlignmentConfig],
     vectors_a: Optional[np.ndarray] = None,
     norms_a: Optional[np.ndarray] = None,
     vectors_b: Optional[np.ndarray] = None, 
@@ -207,32 +215,68 @@ def _needleman_wunsch_align(
         band_width = _calculate_band_width(m, n, config)
     
     # Build similarity matrix
-    if config.use_hashing and vectors_a is not None and vectors_b is not None:
-        # Use precomputed vectors with vectorized computation (FAST!)
-        # Compute dot products: S[i,j] = dot(vectors_a[i], vectors_b[j])
-        S = np.dot(vectors_a, vectors_b.T)
-        
-        # Normalize by outer product of norms: S[i,j] /= (norms_a[i] * norms_b[j])
-        # Replace zero norms with 1 to avoid division by zero
-        norms_a_safe = np.where(norms_a == 0.0, 1.0, norms_a)
-        norms_b_safe = np.where(norms_b == 0.0, 1.0, norms_b)
-        norm_product = np.outer(norms_a_safe, norms_b_safe)
-        S = S / norm_product
-        
-        # Set similarity to 0 where either norm was originally 0
-        zero_mask = (norms_a == 0.0)[:, np.newaxis] | (norms_b == 0.0)[np.newaxis, :]
-        S = np.where(zero_mask, 0.0, S).astype(np.float32)
+    if isinstance(config, EmbeddingAlignmentConfig):
+        # Embedding-based similarity
+        if vectors_a is not None and vectors_b is not None:
+            # Use precomputed embedding vectors with vectorized computation (FAST!)
+            # Compute dot products: S[i,j] = dot(vectors_a[i], vectors_b[j])
+            S = np.dot(vectors_a, vectors_b.T)
+            
+            # Normalize by outer product of norms: S[i,j] /= (norms_a[i] * norms_b[j])
+            # Replace zero norms with 1 to avoid division by zero
+            norms_a_safe = np.where(norms_a == 0.0, 1.0, norms_a)
+            norms_b_safe = np.where(norms_b == 0.0, 1.0, norms_b)
+            norm_product = np.outer(norms_a_safe, norms_b_safe)
+            S = S / norm_product
+            
+            # Set similarity to 0 where either norm was originally 0
+            zero_mask = (norms_a == 0.0)[:, np.newaxis] | (norms_b == 0.0)[np.newaxis, :]
+            S = np.where(zero_mask, 0.0, S).astype(np.float32)
+        else:
+            # Compute embeddings on-the-fly (slower but works)
+            from .embedding import EmbeddingModelManager, _embedding_cosine_similarity
+            model = EmbeddingModelManager.get_model(config)
+            
+            # Compute embeddings for both sets of texts
+            embeddings_a = model.encode(texts_a, convert_to_numpy=True, show_progress_bar=False)
+            embeddings_b = model.encode(texts_b, convert_to_numpy=True, show_progress_bar=False)
+            
+            # Build similarity matrix manually
+            S = np.zeros((m, n), dtype=np.float32)
+            for i in range(m):
+                for j in range(n):
+                    S[i, j] = _embedding_cosine_similarity(embeddings_a[i], embeddings_b[j])
+    
+    elif isinstance(config, NGramAlignmentConfig):
+        # N-gram based similarity
+        if config.use_hashing and vectors_a is not None and vectors_b is not None:
+            # Use precomputed n-gram vectors with vectorized computation (FAST!)
+            # Compute dot products: S[i,j] = dot(vectors_a[i], vectors_b[j])
+            S = np.dot(vectors_a, vectors_b.T)
+            
+            # Normalize by outer product of norms: S[i,j] /= (norms_a[i] * norms_b[j])
+            # Replace zero norms with 1 to avoid division by zero
+            norms_a_safe = np.where(norms_a == 0.0, 1.0, norms_a)
+            norms_b_safe = np.where(norms_b == 0.0, 1.0, norms_b)
+            norm_product = np.outer(norms_a_safe, norms_b_safe)
+            S = S / norm_product
+            
+            # Set similarity to 0 where either norm was originally 0
+            zero_mask = (norms_a == 0.0)[:, np.newaxis] | (norms_b == 0.0)[np.newaxis, :]
+            S = np.where(zero_mask, 0.0, S).astype(np.float32)
+        else:
+            # Compute similarity on the fly (slower fallback)
+            S = np.zeros((m, n), dtype=np.float32)
+            for i in range(m):
+                for j in range(n):
+                    S[i, j] = _char_ngram_cosine_similarity(
+                        texts_a[i], texts_b[j], 
+                        n=config.n_gram_size,
+                        use_hashing=config.use_hashing,
+                        hash_dim=config.hash_dim
+                    )
     else:
-        # Compute similarity on the fly (slower fallback)
-        S = np.zeros((m, n), dtype=np.float32)
-        for i in range(m):
-            for j in range(n):
-                S[i, j] = _char_ngram_cosine_similarity(
-                    texts_a[i], texts_b[j], 
-                    n=config.n_gram_size,
-                    use_hashing=config.use_hashing,
-                    hash_dim=config.hash_dim
-                )
+        raise ValueError(f"Unknown config type: {type(config)}")
     
     # Dynamic programming for alignment
     dp = np.full((m + 1, n + 1), -1e9, dtype=np.float32)
@@ -316,7 +360,7 @@ def _compute_blocks_growmerge(
     similarity_matrix: np.ndarray,
     texts_a: List[str],
     texts_b: List[str],
-    config: BlockAlignmentConfig,
+    config: Union[NGramAlignmentConfig, EmbeddingAlignmentConfig],
 ) -> List[Tuple[Tuple[int, int], Tuple[int, int], float]]:
     """Two-pass grow-merge: expand left, then right, absorbing gaps on either side.
 
@@ -329,13 +373,21 @@ def _compute_blocks_growmerge(
     Only gaps are consumed; blocks do not cross other matches. Covered alignment indices
     are marked used to avoid duplicate emission.
     """
-    # Strip separators and punctuation for grow-merge similarity computation
+    # Similarity computation for grow-merge
     def _strip(s: str) -> str:
+        """Strip separators and punctuation for n-gram similarity."""
         import unicodedata
         return "".join(ch for ch in s if (unicodedata.category(ch))[0] not in ("Z", "P"))
     
     def _cos(a_txt: str, b_txt: str) -> float:
-        return _char_ngram_cosine_similarity(_strip(a_txt), _strip(b_txt), n=config.n_gram_size)
+        """Compute similarity between concatenated text blocks."""
+        if isinstance(config, EmbeddingAlignmentConfig):
+            # Use embedding similarity without stripping (preserve natural text)
+            from youspeak.analysis.embedding import compute_embedding_similarity_on_the_fly
+            return compute_embedding_similarity_on_the_fly(a_txt, b_txt, config)
+        else:
+            # Use n-gram similarity with stripping
+            return _char_ngram_cosine_similarity(_strip(a_txt), _strip(b_txt), n=config.n_gram_size)
     
     used = [False] * len(alignment)
     blocks: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
@@ -448,12 +500,35 @@ def _compute_blocks_growmerge(
 def align_subtitle_pair(
     subtitle_a: Subtitle,
     subtitle_b: Subtitle, 
-    config: BlockAlignmentConfig,
+    config: Union[NGramAlignmentConfig, EmbeddingAlignmentConfig],
 ) -> BlockAlignment:
     """Align two subtitles using NW + grow-merge to produce block alignment."""
-    # Run NW alignment
+    
+    # Precompute similarity vectors based on config type
+    if isinstance(config, EmbeddingAlignmentConfig):
+        # Precompute embeddings for both subtitles
+        from .embedding import build_embedding_vectors_batch
+        all_vectors, all_norms = build_embedding_vectors_batch(
+            [subtitle_a.texts, subtitle_b.texts], config
+        )
+        vectors_a, vectors_b = all_vectors[0], all_vectors[1]
+        norms_a, norms_b = all_norms[0], all_norms[1]
+    elif isinstance(config, NGramAlignmentConfig):
+        # Precompute n-gram vectors for both subtitles
+        all_vectors, all_norms = _build_hashed_ngram_vectors_batch(
+            [subtitle_a.texts, subtitle_b.texts],
+            n=config.n_gram_size,
+            hash_dim=config.hash_dim
+        )
+        vectors_a, vectors_b = all_vectors[0], all_vectors[1]
+        norms_a, norms_b = all_norms[0], all_norms[1]
+    else:
+        vectors_a = vectors_b = norms_a = norms_b = None
+    
+    # Run NW alignment with precomputed vectors
     alignment, similarity_matrix, _ = _needleman_wunsch_align(
-        subtitle_a.texts, subtitle_b.texts, config
+        subtitle_a.texts, subtitle_b.texts, config,
+        vectors_a, norms_a, vectors_b, norms_b
     )
     
     # Compute grow-merge blocks
@@ -483,7 +558,7 @@ def align_subtitle_pair(
 
 def align_subtitle_matrix(
     subtitles: List[Subtitle],
-    config: BlockAlignmentConfig,
+    config: Union[NGramAlignmentConfig, EmbeddingAlignmentConfig],
     metadata: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[BlockAlignment], Dict[str, Any]]:
     """MAIN: Compute all pairwise block alignments efficiently."""
@@ -492,16 +567,24 @@ def align_subtitle_matrix(
     
     start_time = time.time()
     
-    # Precompute n-gram vectors for efficiency
+    # Precompute similarity vectors for efficiency
     precompute_start = time.time()
-    if config.use_hashing:
-        all_vectors, all_norms = _build_hashed_ngram_vectors_batch(
+    if isinstance(config, EmbeddingAlignmentConfig):
+        all_vectors, all_norms = build_embedding_vectors_batch(
             [sub.texts for sub in subtitles],
-            n=config.n_gram_size,
-            hash_dim=config.hash_dim
+            config
         )
+    elif isinstance(config, NGramAlignmentConfig):
+        if config.use_hashing:
+            all_vectors, all_norms = _build_hashed_ngram_vectors_batch(
+                [sub.texts for sub in subtitles],
+                n=config.n_gram_size,
+                hash_dim=config.hash_dim
+            )
+        else:
+            all_vectors = all_norms = None
     else:
-        all_vectors = all_norms = None
+        raise ValueError(f"Unknown config type: {type(config)}")
     precompute_time = time.time() - precompute_start
     
     # Compute all pairwise alignments
@@ -559,8 +642,14 @@ def align_subtitle_matrix(
     total_time = time.time() - start_time
     
     # Update metadata
+    config_dict = config.__dict__.copy()
+    if isinstance(config, EmbeddingAlignmentConfig):
+        config_dict["alignment_type"] = "embedding"
+    elif isinstance(config, NGramAlignmentConfig):
+        config_dict["alignment_type"] = "n_gram"
+    
     metadata.setdefault("block_alignment", {}).update({
-        "config": config.__dict__.copy(),
+        "config": config_dict,
         "total_pairs": len(alignments),
         "computation_time": round(total_time, 3),
         "precomputation_time": round(precompute_time, 3),
