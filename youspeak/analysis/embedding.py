@@ -27,7 +27,9 @@ class EmbeddingAlignmentConfig:
     band_margin_pct: float = 0.10
     
     # Embedding-specific parameters
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # model_name: str = "thenlper/gte-small"
+    model_name: str = "static-similarity-mrl-multilingual-v1" # brrrrr model
     batch_size: int = 32
     max_seq_length: int = 256
     use_gpu: bool = True
@@ -145,7 +147,7 @@ def build_embedding_vectors_batch(
     return all_embeddings, all_norms
 
 
-def compute_embedding_similarity_on_the_fly(
+def compute_embedding_pair(
     text_a: str,
     text_b: str,
     config: EmbeddingAlignmentConfig,
@@ -166,7 +168,7 @@ def compute_embedding_similarity_on_the_fly(
     model = EmbeddingModelManager.get_model(config)
     
     # Batch encode both texts together for efficiency
-    embeddings = model.encode([text_a, text_b], convert_to_numpy=True)
+    embeddings = model.encode([text_a, text_b], convert_to_numpy=True, show_progress_bar=False)
     
     emb_a = embeddings[0]
     emb_b = embeddings[1]

@@ -383,8 +383,9 @@ def _compute_blocks_growmerge(
         """Compute similarity between concatenated text blocks."""
         if isinstance(config, EmbeddingAlignmentConfig):
             # Use embedding similarity without stripping (preserve natural text)
-            from youspeak.analysis.embedding import compute_embedding_similarity_on_the_fly
-            return compute_embedding_similarity_on_the_fly(a_txt, b_txt, config)
+            from youspeak.analysis.embedding import compute_embedding_pair
+            return compute_embedding_pair(a_txt, b_txt, config)
+            #return _char_ngram_cosine_similarity(_strip(a_txt), _strip(b_txt), n=3)
         else:
             # Use n-gram similarity with stripping
             return _char_ngram_cosine_similarity(_strip(a_txt), _strip(b_txt), n=config.n_gram_size)

@@ -191,7 +191,7 @@ def align_pair_cmd(
 	n: int = typer.Option(3, help="Character n-gram size for similarity (n-gram mode only)"),
 	use_hashing: bool = typer.Option(True, help="Use hashed n-gram vectors (faster, n-gram mode only)"),
 	# Embedding parameters (ignored if use_embeddings=False)
-	model_name: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--model", help="Sentence transformer model name (embedding mode only)"),
+	model_name: str = typer.Option("static-similarity-mrl-multilingual-v1", "--model", help="Sentence transformer model name (embedding mode only)"),
 	use_gpu: bool = typer.Option(True, "--use-gpu", help="Use GPU for embedding computation if available (embedding mode only)"),
 	batch_size: int = typer.Option(32, "--batch-size", help="Batch size for embedding computation (embedding mode only)"),
 	# Common alignment parameters
@@ -443,7 +443,7 @@ def align_pipeline_cmd(
 	# N-gram parameters (ignored if use_embeddings=True)
 	n: int = typer.Option(3, help="Character n-gram size for similarity (n-gram mode only)"),
 	# Embedding parameters (ignored if use_embeddings=False)
-	model_name: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--model", help="Sentence transformer model name (embedding mode only)"),
+	model_name: str = typer.Option("static-similarity-mrl-multilingual-v1", "--model", help="Sentence transformer model name (embedding mode only)"),
 	use_gpu: bool = typer.Option(True, "--use-gpu", help="Use GPU for embedding computation if available (embedding mode only)"),
 	batch_size: int = typer.Option(32, "--batch-size", help="Batch size for embedding computation (embedding mode only)"),
 	# Common alignment parameters
