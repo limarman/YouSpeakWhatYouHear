@@ -665,7 +665,8 @@ def select_candidates(
     subtitles: List[Subtitle],
     block_alignments: List[BlockAlignment],
     threshold: float = 0.85,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    return_similarity_matrix: bool = False
 ) -> Tuple[List[int], Dict[str, Any]]:
     """MAIN: Select largest connected component of high-quality alignments."""
     if metadata is None:
@@ -721,6 +722,14 @@ def select_candidates(
         "max_similarity": max_similarity,
         "avg_similarity": avg_similarity,
     })
+    
+    # Add similarity matrix to metadata if requested
+    if return_similarity_matrix:
+        metadata["similarity_matrix"] = {
+            "matrix": similarity_matrix.tolist(),
+            "file_names": [sub.source_file for sub in subtitles],
+            "threshold": threshold
+        }
     
     return component_indices, metadata
 

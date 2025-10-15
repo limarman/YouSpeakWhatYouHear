@@ -459,6 +459,7 @@ def align_pipeline_cmd(
 	clean_threshold: float = typer.Option(0.5, help="Support threshold for cleaning"),
 	output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write aligned SRT files"),
 	show_metadata: bool = typer.Option(True, help="Show processing metadata"),
+	show_similarity_scores: bool = typer.Option(False, "--show-similarity-scores", help="Show aggregated similarity matrix between subtitle files"),
 ) -> None:
 	"""Run the full alignment pipeline with the new alignment module."""
 	from pathlib import Path as _Path
@@ -581,12 +582,42 @@ def align_pipeline_cmd(
 	# Phase 2: Candidate selection
 	print("[blue]Phase 2: Selecting candidates...[/blue]")
 	if component_threshold is not None:
-		candidate_indices, metadata = select_candidates(subtitles, alignments, component_threshold, metadata)
+		candidate_indices, metadata = select_candidates(subtitles, alignments, component_threshold, metadata, return_similarity_matrix=show_similarity_scores)
 	else:
-		candidate_indices, metadata = select_candidates(subtitles, alignments, metadata=metadata)
+		candidate_indices, metadata = select_candidates(subtitles, alignments, metadata=metadata, return_similarity_matrix=show_similarity_scores)
 	print(f"[green]Selected {len(candidate_indices)} candidates from component[/green]")
 	for idx in candidate_indices:
 		print(f"  • {paths[idx].name}")
+	
+	# Show similarity matrix if requested
+	if show_similarity_scores and "similarity_matrix" in metadata:
+		print("\n[blue]Aggregated Similarity Matrix:[/blue]")
+		sim_data = metadata["similarity_matrix"]
+		matrix = sim_data["matrix"]
+		file_names = sim_data["file_names"]
+		threshold = sim_data["threshold"]
+		
+		# Create a table to display the matrix
+		from rich.table import Table as _Table
+		table = _Table(title=f"Similarity Matrix (threshold: {threshold})")
+		
+		# Add columns
+		table.add_column("File", style="cyan")
+		for i, file_name in enumerate(file_names):
+			table.add_column(f"{i}", justify="right", style="white")
+		
+		# Add rows
+		for i, file_name in enumerate(file_names):
+			row = [_Path(file_name).name]
+			for j in range(len(file_names)):
+				similarity = matrix[i][j]
+				if i == j:
+					row.append("1.000")  # Diagonal
+				else:
+					row.append(f"{similarity:.3f}")
+			table.add_row(*row)
+		
+		print(table)
 	
 	# Filter to relevant alignments only (selected <-> selected)
 	candidate_files = {subtitles[idx].source_file for idx in candidate_indices}
