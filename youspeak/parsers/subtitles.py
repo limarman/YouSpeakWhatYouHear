@@ -14,6 +14,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import srt
 import webvtt
+import pysubs2
 
 from ..data.storage import determine_subtitle_path, ensure_parent_dir
 from ..data.db import upsert_content
@@ -163,6 +164,27 @@ def _vtt_ts_to_seconds(ts: str) -> float:
 	return h * 3600 + m * 60 + s
 
 
+def parse_ass_bytes(data: bytes) -> List[Segment]:
+	"""Parse ASS/SSA bytes into normalized segments."""
+	segments: List[Segment] = []
+	# Decode and strip BOM if present
+	text_content = data.decode("utf-8", errors="replace")
+	if text_content.startswith('\ufeff'):
+		text_content = text_content[1:]  # Remove BOM
+	
+	# Parse using pysubs2
+	subs = pysubs2.SSAFile.from_string(text_content)
+	for line in subs:
+		start = line.start / 1000.0  # pysubs2 uses milliseconds
+		end = line.end / 1000.0
+		# Remove ASS formatting tags and normalize text
+		text = line.plaintext.replace("\n", " ").replace("\\N", " ").strip()
+		if text:
+			segments.append(Segment(start, end, text))
+	
+	return segments
+
+
 def ingest_subtitle_from_source(
 	*,
 	source: str,
@@ -183,6 +205,8 @@ def ingest_subtitle_from_source(
 		_ = parse_srt_bytes(data)
 	elif ext == "vtt":
 		_ = parse_vtt_bytes(data)
+	elif ext == "ass":
+		_ = parse_ass_bytes(data)
 	else:
 		raise ValueError(f"Unsupported ext: {ext}")
 

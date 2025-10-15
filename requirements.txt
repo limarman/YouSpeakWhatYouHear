@@ -1,6 +1,7 @@
 yt-dlp>=2024.7.1
 srt>=3.5.3
 webvtt-py>=0.4.6
+pysubs2>=1.7.0
 wordfreq>=3.1
 langdetect>=1.0.9
 regex>=2024.5.15

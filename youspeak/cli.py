@@ -35,8 +35,8 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 @app.command(name="preview-html")
 def preview_html_cmd(
-	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) to preview"),
-	dir: str | None = typer.Option(None, "--dir", help="Folder containing .srt/.vtt"),
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt/.ass) to preview"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing .srt/.vtt/.ass"),
 	recursive: bool = typer.Option(False, help="Recursively include files under --dir"),
 	out: str = typer.Option("preview", help="Output directory for static viewer"),
 	title: str = typer.Option("Subtitle Preview", help="Page title"),
@@ -51,11 +51,11 @@ def preview_html_cmd(
 			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
 		if recursive:
 			for p in sorted(d.rglob("*")):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 		else:
 			for p in sorted(d.iterdir()):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 	if files:
 		paths.extend([_Path(f) for f in files])
@@ -102,12 +102,12 @@ def list_cmd(limit: int = typer.Option(50, help="Max rows to show")) -> None:
 
 @app.command(name="ingest-subtitle")
 def ingest_subtitle_cmd(
-	source: str = typer.Argument(..., help="URL or local path to .srt/.vtt"),
+	source: str = typer.Argument(..., help="URL or local path to .srt/.vtt/.ass"),
 	language: str = typer.Option(..., "--lang", help="Subtitle language code, e.g., en, es"),
 	platform: str = typer.Option("web", help="Platform name (e.g., youtube, web, local)"),
 	platform_id: str | None = typer.Option(None, help="Platform-specific ID; auto/None if omitted"),
 	title: str | None = typer.Option(None, help="Human title; derived from filename if omitted"),
-	ext: str = typer.Option("srt", help="Subtitle extension: srt or vtt"),
+	ext: str = typer.Option("srt", help="Subtitle extension: srt, vtt, or ass"),
 ) -> None:
 	"""Ingest a subtitle file into storage and the database (no fetching)."""
 	# Read bytes from file or URL
@@ -183,8 +183,8 @@ def fetch_opensubtitles_cmd(
 
 @app.command(name="align-pair")
 def align_pair_cmd(
-	file_a: str = typer.Argument(..., help="First subtitle file (.srt/.vtt)"),
-	file_b: str = typer.Argument(..., help="Second subtitle file (.srt/.vtt)"),
+	file_a: str = typer.Argument(..., help="First subtitle file (.srt/.vtt/.ass)"),
+	file_b: str = typer.Argument(..., help="Second subtitle file (.srt/.vtt/.ass)"),
 	n: int = typer.Option(3, help="Character n-gram size for similarity"),
 	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
@@ -198,7 +198,7 @@ def align_pair_cmd(
 ) -> None:
 	"""Test pairwise alignment using the new alignment module."""
 	from pathlib import Path as _Path
-	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 	from .analysis.normalization import normalize_subtitle, NormalizationConfig
 	from .analysis.alignment import _needleman_wunsch_align, _compute_blocks_growmerge, BlockAlignmentConfig
 	from .util.types import Subtitle, BlockAlignment
@@ -212,6 +212,8 @@ def align_pair_cmd(
 			segs = parse_srt_bytes(data)
 		elif ext == "vtt":
 			segs = parse_vtt_bytes(data)
+		elif ext == "ass":
+			segs = parse_ass_bytes(data)
 		else:
 			raise typer.BadParameter(f"Unsupported extension: {ext}")
 		
@@ -381,9 +383,9 @@ def align_pair_cmd(
 
 @app.command(name="align-pipeline")
 def align_pipeline_cmd(
-	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) to align"),
-	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
-	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt/.ass) to align"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt/.ass files"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt/.ass under --dir"),
 	n: int = typer.Option(3, help="Character n-gram size for similarity"),
 	gap_penalty: float = typer.Option(-0.4, help="Gap penalty for NW alignment"),
 	min_sim: float = typer.Option(0.3, help="Hard floor for match acceptance (0..1)"),
@@ -398,7 +400,7 @@ def align_pipeline_cmd(
 ) -> None:
 	"""Run the full alignment pipeline with the new alignment module."""
 	from pathlib import Path as _Path
-	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 	from .analysis.normalization import normalize_subtitle, NormalizationConfig
 	from .analysis.alignment import (
 		align_subtitle_matrix, 
@@ -418,11 +420,11 @@ def align_pipeline_cmd(
 			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
 		if recursive:
 			for p in sorted(d.rglob("*")):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 		else:
 			for p in sorted(d.iterdir()):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 	if files:
 		paths.extend([_Path(f) for f in files])
@@ -449,6 +451,8 @@ def align_pipeline_cmd(
 			segs = parse_srt_bytes(data)
 		elif ext == "vtt":
 			segs = parse_vtt_bytes(data)
+		elif ext == "ass":
+			segs = parse_ass_bytes(data)
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		
@@ -603,9 +607,9 @@ def align_pipeline_cmd(
 
 @app.command(name="tokenize")
 def tokenize_cmd(
-	files: list[str] | None = typer.Argument(None, help="Subtitle file(s) (.srt/.vtt) to tokenize"),
+	files: list[str] | None = typer.Argument(None, help="Subtitle file(s) (.srt/.vtt/.ass) to tokenize"),
 	dir: str | None = typer.Option(None, "--dir", help="Folder containing subtitle files"),
-	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt/.ass under --dir"),
 	language: str | None = typer.Option(None, "--lang", help="Language code for tokenization (e.g., en, es, de). If not specified, language will be auto-detected."),
 	already_normalized: bool = typer.Option(False, help="Skip normalization if already normalized"),
 	show_tokens: bool = typer.Option(False, help="Display the extracted tokens (only for single file)"),
@@ -614,7 +618,7 @@ def tokenize_cmd(
 ) -> None:
 	"""Extract tokens from subtitle file(s) for speech speed analysis and vocabulary frequency."""
 	from pathlib import Path as _Path
-	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 	from .analysis.tokens import (
 		tokenize_subtitle, 
 		tokenize_subtitles,
@@ -633,11 +637,11 @@ def tokenize_cmd(
 			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
 		if recursive:
 			for p in sorted(d.rglob("*")):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 		else:
 			for p in sorted(d.iterdir()):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 	if files:
 		paths.extend([_Path(f) for f in files])
@@ -664,6 +668,8 @@ def tokenize_cmd(
 			segs = parse_srt_bytes(data)
 		elif ext == "vtt":
 			segs = parse_vtt_bytes(data)
+		elif ext == "ass":
+			segs = parse_ass_bytes(data)
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		
@@ -900,9 +906,9 @@ def tokenize_cmd(
 
 @app.command(name="consensus")
 def consensus_cmd(
-	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt) for consensus"),
-	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt files"),
-	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt under --dir"),
+	files: list[str] | None = typer.Argument(None, help="Subtitle files (.srt/.vtt/.ass) for consensus"),
+	dir: str | None = typer.Option(None, "--dir", help="Folder containing candidate .srt/.vtt/.ass files"),
+	recursive: bool = typer.Option(False, help="Recursively search for .srt/.vtt/.ass under --dir"),
 	target_agreement_pct: float = typer.Option(0.66, help="Target agreement percentage (0.0-1.0)"),
 	merge_micro_gaps: bool = typer.Option(True, help="Merge small gaps between intervals"),
 	micro_gap_seconds: float = typer.Option(0.2, help="Maximum gap size to merge (seconds)"),
@@ -912,7 +918,7 @@ def consensus_cmd(
 ) -> None:
 	"""Compute speech time consensus from multiple subtitle files."""
 	from pathlib import Path as _Path
-	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+	from .parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 	from .analysis.consensus import compute_consensus, export_consensus_srt, ConsensusConfig
 	from .util.types import Subtitle
 	
@@ -924,11 +930,11 @@ def consensus_cmd(
 			raise typer.BadParameter(f"--dir path is not a directory: {dir}")
 		if recursive:
 			for p in sorted(d.rglob("*")):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 		else:
 			for p in sorted(d.iterdir()):
-				if p.suffix.lower() in (".srt", ".vtt") and p.is_file():
+				if p.suffix.lower() in (".srt", ".vtt", ".ass") and p.is_file():
 					paths.append(p)
 	if files:
 		paths.extend([_Path(f) for f in files])
@@ -955,6 +961,8 @@ def consensus_cmd(
 			segs = parse_srt_bytes(data)
 		elif ext == "vtt":
 			segs = parse_vtt_bytes(data)
+		elif ext == "ass":
+			segs = parse_ass_bytes(data)
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		

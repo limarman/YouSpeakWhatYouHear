@@ -6,7 +6,7 @@ from typing import List, Sequence, Tuple
 import json
 import webbrowser
 
-from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 
 
 INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
@@ -312,6 +312,8 @@ def generate_static_preview(paths: Sequence[Path], out_dir: Path, *, title: str 
 			segs = parse_srt_bytes(data)
 		elif ext == "vtt":
 			segs = parse_vtt_bytes(data)
+		elif ext == "ass":
+			segs = parse_ass_bytes(data)
 		else:
 			raise ValueError(f"Unsupported extension: {ext}")
 		cues = []
