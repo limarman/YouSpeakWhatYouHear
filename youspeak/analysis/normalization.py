@@ -171,6 +171,49 @@ def normalize_subtitle_text(
     return s
 
 
+def _filter_empty_cues(subtitle: Subtitle) -> tuple[Subtitle, Dict[str, Any]]:
+    """Filter out cues without alphanumeric content.
+    
+    Removes cues that contain no letters or digits (empty, whitespace-only, or symbol-only).
+    Keeps intervals, texts, and original_texts synchronized.
+    
+    Args:
+        subtitle: Subtitle with normalized texts
+        
+    Returns:
+        (filtered_subtitle, filter_stats)
+    """
+    filtered_intervals = []
+    filtered_texts = []
+    filtered_original_texts = [] if subtitle.original_texts else None
+    removed_count = 0
+    
+    for i, text in enumerate(subtitle.texts):
+        # Keep cue if it has at least one alphanumeric character
+        if any(c.isalnum() for c in text):
+            filtered_intervals.append(subtitle.intervals[i])
+            filtered_texts.append(text)
+            if subtitle.original_texts:
+                filtered_original_texts.append(subtitle.original_texts[i])
+        else:
+            removed_count += 1
+    
+    filtered_subtitle = Subtitle(
+        source_file=subtitle.source_file,
+        intervals=filtered_intervals,
+        texts=filtered_texts,
+        original_texts=filtered_original_texts
+    )
+    
+    stats = {
+        "cues_before_filtering": len(subtitle.texts),
+        "cues_after_filtering": len(filtered_texts),
+        "filtered_cues": removed_count
+    }
+    
+    return filtered_subtitle, stats
+
+
 def normalize_subtitle(
     subtitle: Subtitle, 
     config: NormalizationConfig,
@@ -205,16 +248,21 @@ def normalize_subtitle(
     # Create new subtitle with normalized texts
     normalized_subtitle = Subtitle(
         source_file=subtitle.source_file,
-        intervals=subtitle.intervals.copy(),  # Keep original timing
+        intervals=subtitle.intervals.copy(),
         texts=normalized_texts,
-        original_texts=subtitle.original_texts  # Pass through as-is
+        original_texts=subtitle.original_texts
     )
     
-    # Track per-file stats (no config duplication)
+    # Filter out empty cues (no alphanumeric content)
+    filtered_subtitle, filter_stats = _filter_empty_cues(normalized_subtitle)
+    
+    # Track per-file stats
     file_stats = {
         "total_cues": len(subtitle.texts),
         "empty_cues_before": sum(1 for t in subtitle.texts if not t.strip()),
         "empty_cues_after": sum(1 for t in normalized_texts if not t.strip()),
+        "cues_after_filtering": filter_stats["cues_after_filtering"],
+        "filtered_cues": filter_stats["filtered_cues"]
     }
     
     # Initialize normalization metadata structure if needed
@@ -227,7 +275,7 @@ def normalize_subtitle(
     # Store per-file stats
     metadata["normalization"]["files"][subtitle.source_file] = file_stats
     
-    return normalized_subtitle, metadata
+    return filtered_subtitle, metadata
 
 
 def normalize_subtitles(
