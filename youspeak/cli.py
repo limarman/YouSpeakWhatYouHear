@@ -460,6 +460,7 @@ def align_pipeline_cmd(
 	output_dir: str | None = typer.Option(None, "--output-dir", help="Directory to write aligned SRT files"),
 	show_metadata: bool = typer.Option(True, help="Show processing metadata"),
 	show_similarity_scores: bool = typer.Option(False, "--show-similarity-scores", help="Show aggregated similarity matrix between subtitle files"),
+	debug: bool = typer.Option(False, "--debug", help="Enable detailed debugging output: show separate text matching vs time matching components, raw NW similarity matrices, and per-pair breakdowns"),
 ) -> None:
 	"""Run the full alignment pipeline with the new alignment module."""
 	from pathlib import Path as _Path
@@ -576,48 +577,137 @@ def align_pipeline_cmd(
 			use_banded=use_banded,
 			band_margin_pct=band_margin_pct
 		)
-	alignments, metadata = align_subtitle_matrix(subtitles, config, metadata)
+	alignments, metadata = align_subtitle_matrix(subtitles, config, metadata, return_debug_info=debug)
 	print(f"[green]Computed {len(alignments)} pairwise alignments[/green]")
 	
 	# Phase 2: Candidate selection
 	print("[blue]Phase 2: Selecting candidates...[/blue]")
 	if component_threshold is not None:
-		candidate_indices, metadata = select_candidates(subtitles, alignments, component_threshold, metadata, return_similarity_matrix=show_similarity_scores)
+		candidate_indices, metadata = select_candidates(subtitles, alignments, component_threshold, metadata, return_debug_info=(debug or show_similarity_scores))
 	else:
-		candidate_indices, metadata = select_candidates(subtitles, alignments, metadata=metadata, return_similarity_matrix=show_similarity_scores)
+		candidate_indices, metadata = select_candidates(subtitles, alignments, metadata=metadata, return_debug_info=(debug or show_similarity_scores))
 	print(f"[green]Selected {len(candidate_indices)} candidates from component[/green]")
 	for idx in candidate_indices:
 		print(f"  • {paths[idx].name}")
 	
-	# Show similarity matrix if requested
-	if show_similarity_scores and "similarity_matrix" in metadata:
-		print("\n[blue]Aggregated Similarity Matrix:[/blue]")
-		sim_data = metadata["similarity_matrix"]
-		matrix = sim_data["matrix"]
-		file_names = sim_data["file_names"]
-		threshold = sim_data["threshold"]
+	# Show debug information if requested
+	if (show_similarity_scores or debug) and "debug_info" in metadata:
+		debug_info = metadata["debug_info"]
 		
-		# Create a table to display the matrix
-		from rich.table import Table as _Table
-		table = _Table(title=f"Similarity Matrix (threshold: {threshold})")
+		# Show similarity matrix if requested
+		if show_similarity_scores and "combined_similarity_matrix" in debug_info:
+			print("\n[blue]Combined Similarity Matrix:[/blue]")
+			matrix = debug_info["combined_similarity_matrix"]
+			file_names = debug_info["file_names"]
+			threshold = debug_info["threshold"]
+			
+			from rich.table import Table as _Table
+			table = _Table(title=f"Combined Similarity Matrix (threshold: {threshold})")
+			
+			table.add_column("File", style="cyan")
+			for i in range(len(file_names)):
+				table.add_column(f"{i}", justify="right", style="white")
+			
+			for i, file_name in enumerate(file_names):
+				row = [_Path(file_name).name]
+				for j in range(len(file_names)):
+					similarity = matrix[i][j]
+					if i == j:
+						row.append("1.000")
+					else:
+						row.append(f"{similarity:.3f}")
+				table.add_row(*row)
+			
+			print(table)
 		
-		# Add columns
-		table.add_column("File", style="cyan")
-		for i, file_name in enumerate(file_names):
-			table.add_column(f"{i}", justify="right", style="white")
+		# Show component matrices if debug enabled
+		if debug and "block_similarity_matrix" in debug_info and "coverage_matrix" in debug_info:
+			print("\n[blue]Component Matrices:[/blue]")
+			from rich.table import Table as _Table
+			
+			block_sim_matrix = debug_info["block_similarity_matrix"]
+			coverage_matrix = debug_info["coverage_matrix"]
+			combined_matrix = debug_info["combined_similarity_matrix"]
+			file_names = debug_info["file_names"]
+			
+			# Create table for block similarity (text matching)
+			table_block = _Table(title="Block Similarity (Text Matching Component)")
+			table_block.add_column("File", style="cyan")
+			for i in range(len(file_names)):
+				table_block.add_column(f"{i}", justify="right", style="green")
+			
+			for i, file_name in enumerate(file_names):
+				row = [_Path(file_name).name]
+				for j in range(len(file_names)):
+					val = block_sim_matrix[i][j]
+					if i == j:
+						row.append("1.000")
+					else:
+						row.append(f"{val:.3f}")
+				table_block.add_row(*row)
+			
+			print(table_block)
+			
+			# Create table for coverage (time matching)
+			table_coverage = _Table(title="Coverage (Time Matching Component)")
+			table_coverage.add_column("File", style="cyan")
+			for i in range(len(file_names)):
+				table_coverage.add_column(f"{i}", justify="right", style="yellow")
+			
+			for i, file_name in enumerate(file_names):
+				row = [_Path(file_name).name]
+				for j in range(len(file_names)):
+					val = coverage_matrix[i][j]
+					if i == j:
+						row.append("1.000")
+					else:
+						row.append(f"{val:.3f}")
+				table_coverage.add_row(*row)
+			
+			print(table_coverage)
+			
+			# Create table for combined
+			table_combined = _Table(title="Combined Score (block_similarity × coverage)")
+			table_combined.add_column("File", style="cyan")
+			for i in range(len(file_names)):
+				table_combined.add_column(f"{i}", justify="right", style="magenta")
+			
+			for i, file_name in enumerate(file_names):
+				row = [_Path(file_name).name]
+				for j in range(len(file_names)):
+					val = combined_matrix[i][j]
+					if i == j:
+						row.append("1.000")
+					else:
+						row.append(f"{val:.3f}")
+				table_combined.add_row(*row)
+			
+			print(table_combined)
 		
-		# Add rows
-		for i, file_name in enumerate(file_names):
-			row = [_Path(file_name).name]
-			for j in range(len(file_names)):
-				similarity = matrix[i][j]
-				if i == j:
-					row.append("1.000")  # Diagonal
-				else:
-					row.append(f"{similarity:.3f}")
-			table.add_row(*row)
-		
-		print(table)
+		# Show per-pair component breakdown
+		if "component_breakdown" in debug_info:
+			print("\n[blue]Per-Pair Component Breakdown:[/blue]")
+			breakdown = debug_info["component_breakdown"]
+			from rich.table import Table as _Table
+			
+			table = _Table(title="Detailed Breakdown by File Pair")
+			table.add_column("File Pair", style="cyan")
+			table.add_column("Block Sim", justify="right", style="green")
+			table.add_column("Coverage", justify="right", style="yellow")
+			table.add_column("Combined", justify="right", style="magenta")
+			
+			for pair_key, components in breakdown.items():
+				# Shorten file names for display
+				file_a, file_b = pair_key.split("__vs__")
+				short_pair = f"{_Path(file_a).stem} ↔ {_Path(file_b).stem}"
+				table.add_row(
+					short_pair,
+					f"{components['block_similarity']:.4f}",
+					f"{components['coverage']:.4f}",
+					f"{components['combined_score']:.4f}"
+				)
+			
+			print(table)
 	
 	# Filter to relevant alignments only (selected <-> selected)
 	candidate_files = {subtitles[idx].source_file for idx in candidate_indices}

@@ -560,9 +560,20 @@ def align_subtitle_pair(
 def align_subtitle_matrix(
     subtitles: List[Subtitle],
     config: Union[NGramAlignmentConfig, EmbeddingAlignmentConfig],
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    return_debug_info: bool = False
 ) -> Tuple[List[BlockAlignment], Dict[str, Any]]:
-    """MAIN: Compute all pairwise block alignments efficiently."""
+    """MAIN: Compute all pairwise block alignments efficiently.
+    
+    Args:
+        subtitles: List of subtitle files to align
+        config: Alignment configuration (NGram or Embedding)
+        metadata: Optional metadata dict to populate
+        return_debug_info: If True, include raw NW similarity matrices in metadata
+        
+    Returns:
+        Tuple of (block_alignments, metadata)
+    """
     if metadata is None:
         metadata = {}
     
@@ -592,6 +603,10 @@ def align_subtitle_matrix(
     alignments = []
     n = len(subtitles)
     
+    # Debug storage for raw similarity matrices
+    if return_debug_info:
+        raw_nw_matrices = {}
+    
     nw_time = 0.0
     growmerge_time = 0.0
     
@@ -610,6 +625,18 @@ def align_subtitle_matrix(
                 vectors_a, norms_a, vectors_b, norms_b
             )
             nw_time += time.time() - nw_start
+            
+            # Store raw NW similarity matrix if debugging
+            if return_debug_info:
+                pair_key = f"{subtitles[i].source_file}__vs__{subtitles[j].source_file}"
+                raw_nw_matrices[pair_key] = {
+                    "matrix": similarity_matrix.tolist(),
+                    "shape": similarity_matrix.shape,
+                    "file_a": subtitles[i].source_file,
+                    "file_b": subtitles[j].source_file,
+                    "num_cues_a": len(subtitles[i].texts),
+                    "num_cues_b": len(subtitles[j].texts)
+                }
             
             # Compute blocks
             gm_start = time.time()
@@ -658,6 +685,12 @@ def align_subtitle_matrix(
         "growmerge_time": round(growmerge_time, 3)
     })
     
+    # Add raw NW matrices to debug info if requested
+    if return_debug_info:
+        metadata.setdefault("debug_info", {}).update({
+            "raw_nw_similarity_matrices": raw_nw_matrices
+        })
+    
     return alignments, metadata
 
 
@@ -666,7 +699,7 @@ def select_candidates(
     block_alignments: List[BlockAlignment],
     threshold: float = 0.85,
     metadata: Optional[Dict[str, Any]] = None,
-    return_similarity_matrix: bool = False
+    return_debug_info: bool = False
 ) -> Tuple[List[int], Dict[str, Any]]:
     """MAIN: Select largest connected component of high-quality alignments."""
     if metadata is None:
@@ -677,6 +710,12 @@ def select_candidates(
     # Build similarity matrix from block alignments
     similarity_matrix = np.zeros((n, n), dtype=np.float32)
     
+    # Debug matrices (only if requested)
+    if return_debug_info:
+        block_similarity_matrix = np.zeros((n, n), dtype=np.float32)
+        coverage_matrix = np.zeros((n, n), dtype=np.float32)
+        debug_components = {}
+    
     # Create file to index mapping
     file_to_idx = {sub.source_file: i for i, sub in enumerate(subtitles)}
     
@@ -686,13 +725,28 @@ def select_candidates(
         j = file_to_idx[alignment.file_b]
         
         # Compute combined score (block similarity * coverage)
-        combined_score = _compute_combined_score(alignment, subtitles[i], subtitles[j])
+        if return_debug_info:
+            combined_score, components = _compute_combined_score(
+                alignment, subtitles[i], subtitles[j], return_components=True
+            )
+            pair_key = f"{alignment.file_a}__vs__{alignment.file_b}"
+            debug_components[pair_key] = components
+            
+            block_similarity_matrix[i, j] = components['block_similarity']
+            block_similarity_matrix[j, i] = components['block_similarity']
+            coverage_matrix[i, j] = components['coverage']
+            coverage_matrix[j, i] = components['coverage']
+        else:
+            combined_score = _compute_combined_score(alignment, subtitles[i], subtitles[j])
         
         similarity_matrix[i, j] = combined_score
         similarity_matrix[j, i] = combined_score
     
     # Set diagonal to 1.0
     np.fill_diagonal(similarity_matrix, 1.0)
+    if return_debug_info:
+        np.fill_diagonal(block_similarity_matrix, 1.0)
+        np.fill_diagonal(coverage_matrix, 1.0)
     
     # Find largest connected component
     component_indices = _largest_connected_component(similarity_matrix, threshold)
@@ -710,7 +764,6 @@ def select_candidates(
         max_similarity = float(np.max(component_edges))
         avg_similarity = float(np.mean(component_edges))
     else:
-        # Single file in component - no edges
         min_similarity = max_similarity = avg_similarity = None
     
     # Update metadata
@@ -723,12 +776,15 @@ def select_candidates(
         "avg_similarity": avg_similarity,
     })
     
-    # Add similarity matrix to metadata if requested
-    if return_similarity_matrix:
-        metadata["similarity_matrix"] = {
-            "matrix": similarity_matrix.tolist(),
+    # Add debug info to metadata if requested
+    if return_debug_info:
+        metadata["debug_info"] = {
+            "combined_similarity_matrix": similarity_matrix.tolist(),
+            "block_similarity_matrix": block_similarity_matrix.tolist(),
+            "coverage_matrix": coverage_matrix.tolist(),
             "file_names": [sub.source_file for sub in subtitles],
-            "threshold": threshold
+            "threshold": threshold,
+            "component_breakdown": debug_components
         }
     
     return component_indices, metadata
@@ -980,11 +1036,24 @@ def _compute_combined_score(
     alignment: BlockAlignment, 
     subtitle_a: Subtitle, 
     subtitle_b: Subtitle,
-    min_sim_for_coverage: float = 0.3
-) -> float:
+    min_sim_for_coverage: float = 0.3,
+    return_components: bool = False
+) -> Union[float, Tuple[float, Dict[str, float]]]:
     """Compute combined score (block similarity * coverage) for an alignment."""
-    if alignment.num_blocks == 0:
+    
+    def _make_zero_result():
+        if return_components:
+            return 0.0, {
+                'block_similarity': 0.0,
+                'coverage': 0.0,
+                'coverage_a': 0.0,
+                'coverage_b': 0.0,
+                'combined_score': 0.0
+            }
         return 0.0
+    
+    if alignment.num_blocks == 0:
+        return _make_zero_result()
     
     # Compute block similarity (weighted average)
     total_weight = 0.0
@@ -1007,7 +1076,7 @@ def _compute_combined_score(
             total_weight += weight
     
     if total_weight == 0.0:
-        return 0.0
+        return _make_zero_result()
     
     block_similarity = weighted_score / total_weight
     
@@ -1032,13 +1101,24 @@ def _compute_combined_score(
     total_duration_b = sum(end - start for start, end in subtitle_b.intervals)
     
     if total_duration_a == 0.0 or total_duration_b == 0.0:
-        return 0.0
+        return _make_zero_result()
     
     coverage_a = matched_duration_a / total_duration_a
     coverage_b = matched_duration_b / total_duration_b
     coverage = (coverage_a + coverage_b) / 2.0
     
-    return block_similarity * coverage
+    combined_score = block_similarity * coverage
+    
+    if return_components:
+        return combined_score, {
+            'block_similarity': round(float(block_similarity), 6),
+            'coverage': round(float(coverage), 6),
+            'coverage_a': round(float(coverage_a), 6),
+            'coverage_b': round(float(coverage_b), 6),
+            'combined_score': round(float(combined_score), 6)
+        }
+    
+    return combined_score
 
 
 def _largest_connected_component(
