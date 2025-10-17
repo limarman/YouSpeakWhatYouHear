@@ -938,17 +938,26 @@ def clean_subtitle(
     
     num_cues = len(subtitle.texts)
     
-    # Special case: if there are no supporting alignments (single file case),
-    # keep all cues - there's nothing to compare against
+    # Special cases: skip cleaning if no supporting alignments or threshold <= 0
+    skip_cleaning = False
+    skip_reason = None
+    
     if not supporting_alignments:
+        skip_cleaning = True
+        skip_reason = "No cleaning performed - single file with no supporting alignments"
+    elif support_threshold <= 0.0:
+        skip_cleaning = True
+        skip_reason = "No cleaning performed - threshold <= 0.0"
+    
+    if skip_cleaning:
         metadata.setdefault("cleaning", {}).update({
             "support_threshold": support_threshold,
-            "supporting_alignments": 0,
+            "supporting_alignments": len(supporting_alignments),
             "original_cues": num_cues,
             "cleaned_cues": num_cues,
             "removed_cues": 0,
             "removed_indices": [],
-            "note": "No cleaning performed - single file with no supporting alignments"
+            "note": skip_reason
         })
         return subtitle, metadata
     
