@@ -6,6 +6,7 @@ Primary Commands:
   - consensus: Compute speech time consensus from multiple subtitle files
   - tokenize: Extract tokens from a subtitle file for speech speed analysis
   - preview-html: Generate HTML preview of subtitles
+  - speech-time: Analyze speech time from IMDB ID using OpenSubtitles
   - init-db, list, ingest-subtitle: Database operations
   - fetch-subliminal-candidates: Fetch subtitle candidates from subliminal search
   - fetch-opensubtitles: Download subtitles directly from OpenSubtitles.org by IMDB ID
@@ -25,6 +26,7 @@ from .parsers.subtitles import ingest_subtitle_from_source
 from .viewer.static_viewer import generate_static_preview
 from .fetchers.subliminal_fetcher import fetch_candidates_with_subliminal_search
 from .fetchers.opensubtitles_fetcher import fetch_subtitles_from_opensubtitles
+from .pipelines.speech_time_pipeline import SpeechTimePipeline, SpeechTimePipelineConfig
 
 
 # Enable INFO-level logging globally so Subliminal's logger.info messages are printed
@@ -1033,3 +1035,56 @@ def consensus_cmd(
 		print(f"[green]Wrote consensus SRT to[/green] {consensus_srt_file}")
 	
 	print("\n[green]Consensus computation complete![/green]")
+
+
+@app.command(name="speech-time")
+def speech_time_cmd(
+	imdb_id: str = typer.Argument(..., help="IMDB ID (e.g., 'tt0903747' or '903747')"),
+	language: str = typer.Option("all", "--lang", help="Subtitle language code (e.g., eng, es, de). Use 'all' for all languages."),
+	max_subtitles: int = typer.Option(5, "--max-subtitles", help="Maximum number of subtitles to download"),
+	micro_gap_seconds: float = typer.Option(0.2, "--micro-gap", help="Maximum gap size to merge (seconds)"),
+	use_consensus: bool = typer.Option(False, "--consensus/--no-consensus", help="Compute consensus speech time"),
+	consensus_threshold: float = typer.Option(0.66, "--consensus-threshold", help="Agreement threshold for consensus (0.0-1.0)"),
+	output_format: str = typer.Option("table", "--format", help="Output format: json, table, or csv"),
+	output_file: str | None = typer.Option(None, "--output", help="Output file (for json/csv formats)"),
+	delay_seconds: float = typer.Option(0.7, "--delay", help="Delay between downloads in seconds (0 to disable)"),
+) -> None:
+	"""Analyze speech time from IMDB ID using OpenSubtitles subtitles.
+	
+	This command fetches subtitles from OpenSubtitles.org for the given IMDB ID,
+	computes individual speech times, and optionally computes consensus speech time.
+	
+	Examples:
+	  youspeak speech-time tt0903747
+	  youspeak speech-time tt0903747 --lang eng --max-subtitles 15
+	  youspeak speech-time tt0903747 --format json --output results.json
+	"""
+	from rich.console import Console
+	
+	# Create configuration
+	config = SpeechTimePipelineConfig(
+		imdb_id=imdb_id,
+		language=language,
+		max_subtitles=max_subtitles,
+		micro_gap_seconds=micro_gap_seconds,
+		use_consensus=use_consensus,
+		consensus_threshold=consensus_threshold,
+		output_format=output_format,
+		output_file=output_file,
+		delay_seconds=delay_seconds
+	)
+	
+	# Create console for progress reporting
+	console = Console()
+	
+	# Run pipeline
+	try:
+		pipeline = SpeechTimePipeline(config, console)
+		result = pipeline.run()
+		
+		# Success message
+		console.print("\n[green]Speech time analysis complete![/green]")
+		
+	except Exception as e:
+		console.print(f"\n[red]Error: {str(e)}[/red]")
+		raise typer.Exit(1)

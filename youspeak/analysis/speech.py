@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes
+from ..parsers.subtitles import parse_srt_bytes, parse_vtt_bytes, parse_ass_bytes
 
 
 def _merge_intervals(
@@ -48,11 +48,13 @@ def analyze_subtitle_bytes(
 	*,
 	micro_gap_seconds: float = 0.2,
 ) -> Dict[str, float]:
-	"""Compute speech duration metrics from subtitle bytes for given ext ('srt'|'vtt')."""
+	"""Compute speech duration metrics from subtitle bytes for given ext ('srt'|'vtt'|'ass')."""
 	if ext.lower() == "srt":
 		segments = parse_srt_bytes(data)
 	elif ext.lower() == "vtt":
 		segments = parse_vtt_bytes(data)
+	elif ext.lower() == "ass":
+		segments = parse_ass_bytes(data)
 	else:
 		raise ValueError(f"Unsupported subtitle extension: {ext}")
 
